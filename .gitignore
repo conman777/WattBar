@@ -1,0 +1,6 @@
+.DS_Store
+WattBar.app/
+backups/
+Tools/bin/
+*.o
+*.dSYM/
