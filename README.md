@@ -39,10 +39,13 @@ On Windows 10 or Windows 11, clone or download this repository and double-click:
 WattBar.Windows.cmd
 ```
 
-The launcher builds `WattBar.Windows.exe` on first use and starts Watt Bar in
-the Windows notification area. It uses Windows PowerShell 5.1 and .NET Framework
-4.8, both included with current Windows 10/11 installations. The Windows build
-has no NuGet, package-manager, or network dependency.
+The launcher builds `WattBar.Windows.exe` on first use and opens the WattBar
+power dashboard. Closing the dashboard keeps WattBar available in the Windows
+notification area; left-click the tray icon or launch WattBar again to reopen
+it. The app uses Windows
+PowerShell 5.1 and .NET Framework 4.8, both included with current Windows 10/11
+installations. The Windows build has no NuGet, package-manager, or network
+dependency.
 
 To build and run its automated tracking/formatting checks explicitly:
 
@@ -52,9 +55,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 The Windows tray menu provides live battery-discharge watts when the hardware
-reports them or whole-device watts from an external meter bridge, persisted
-tracking time and Wh/kWh totals, South Africa and United Kingdom costs, editable
-tariffs, selectable refresh intervals, and reset controls. See
+reports them or whole-device watts from an external meter bridge. On supported
+desktops it also reads CPU package power and utilization from Windows hardware
+energy counters and NVIDIA GPU power and utilization from the installed driver.
+The current Windows build also identifies the three installed monitor models,
+uses DDC/CI to detect whether each one is on or asleep, and adds its appropriate
+researched wattage to the PC estimate. It provides persisted tracking time and
+Wh/kWh totals, South Africa and United Kingdom costs, editable tariffs,
+selectable refresh intervals, and reset controls. See
 [the Windows-specific documentation](Sources/WattBar.Windows/README.md) for
 telemetry limitations and packaging details.
 
