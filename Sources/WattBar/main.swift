@@ -11,6 +11,18 @@ private enum DefaultsKey {
     static let showActiveApps = "showActiveApps"
     static let showMenuBarLabel = "showMenuBarLabel"
     static let showChargingRate = "showChargingRate"
+    static let trackEnergyUsage = "trackEnergyUsage"
+    static let accumulatedEnergyWh = "accumulatedEnergyWh"
+    static let accumulatedTrackingSeconds = "accumulatedTrackingSeconds"
+    static let southAfricaTariff = "southAfricaTariffRandPerKWh"
+    static let unitedKingdomTariff = "unitedKingdomTariffPoundsPerKWh"
+}
+
+private enum DefaultTariff {
+    // Electricity prices vary by provider, region, payment method, and time.
+    // These are editable example unit rates, not universal or guaranteed prices.
+    static let southAfricaRandPerKWh = 3.50
+    static let unitedKingdomPoundsPerKWh = 0.2611
 }
 
 private struct PowerReading {
@@ -28,6 +40,50 @@ private struct ActiveApp {
     let name: String
     let cpu: Double
     let memoryMB: Int
+}
+
+private struct EnergyAccumulator {
+    private(set) var wattHours: Double
+    private(set) var activeSeconds: TimeInterval
+    private var previousSample: (watts: Double, date: Date)?
+
+    init(wattHours: Double, activeSeconds: TimeInterval) {
+        self.wattHours = max(0, wattHours.isFinite ? wattHours : 0)
+        self.activeSeconds = max(0, activeSeconds.isFinite ? activeSeconds : 0)
+    }
+
+    mutating func addSample(
+        watts: Double?,
+        at date: Date,
+        maximumInterval: TimeInterval
+    ) {
+        guard let watts, watts.isFinite, watts >= 0 else {
+            previousSample = nil
+            return
+        }
+
+        defer {
+            previousSample = (watts, date)
+        }
+
+        guard let previousSample else { return }
+        let elapsedSeconds = date.timeIntervalSince(previousSample.date)
+        guard elapsedSeconds > 0, elapsedSeconds <= maximumInterval else { return }
+
+        let averageWatts = (previousSample.watts + watts) / 2
+        wattHours += averageWatts * elapsedSeconds / 3_600
+        activeSeconds += elapsedSeconds
+    }
+
+    mutating func pause() {
+        previousSample = nil
+    }
+
+    mutating func reset() {
+        wattHours = 0
+        activeSeconds = 0
+        previousSample = nil
+    }
 }
 
 private final class InstanceLock {
@@ -59,18 +115,79 @@ private final class InstanceLock {
     }
 }
 
-private final class BatteryPowerReader {
-    func read() -> PowerReading {
+private struct ExternalPowerSample {
+    let watts: Double
+    let ageSeconds: TimeInterval
+}
+
+private final class ExternalPowerReader {
+    let inputURL: URL = {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+        return appSupport
+            .appendingPathComponent("WattBar", isDirectory: true)
+            .appendingPathComponent("external-power-watts.txt")
+    }()
+
+    func read(maximumAge: TimeInterval, now: Date) -> ExternalPowerSample? {
+        let path = inputURL.path
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let modifiedAt = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+
+        let age = max(0, now.timeIntervalSince(modifiedAt))
+        guard age <= maximumAge,
+              let contents = try? String(contentsOf: inputURL, encoding: .utf8),
+              let watts = Double(contents.trimmingCharacters(in: .whitespacesAndNewlines)),
+              watts.isFinite,
+              watts >= 0,
+              watts <= 100_000 else {
+            return nil
+        }
+
+        return ExternalPowerSample(watts: watts, ageSeconds: age)
+    }
+}
+
+private final class SystemPowerReader {
+    private let externalPowerReader = ExternalPowerReader()
+
+    func read(maximumExternalAge: TimeInterval) -> PowerReading {
+        let updatedAt = Date()
+        let externalSample = externalPowerReader.read(
+            maximumAge: maximumExternalAge,
+            now: updatedAt
+        )
+
         guard let properties = batteryProperties() else {
+            if let externalSample {
+                return PowerReading(
+                    systemWatts: externalSample.watts,
+                    adapterInputWatts: nil,
+                    batteryPercent: nil,
+                    powerState: "Desktop / no system battery",
+                    batteryFlowWatts: nil,
+                    source: "External whole-device meter",
+                    details: String(
+                        format: "Fresh local meter sample (%.1f s old)",
+                        externalSample.ageSeconds
+                    ),
+                    updatedAt: updatedAt
+                )
+            }
+
             return PowerReading(
                 systemWatts: nil,
                 adapterInputWatts: nil,
                 batteryPercent: nil,
-                powerState: "Battery telemetry unavailable",
+                powerState: "Desktop / no system battery",
                 batteryFlowWatts: nil,
-                source: "Unavailable",
-                details: "No AppleSmartBattery sensor found",
-                updatedAt: Date()
+                source: "Whole-device telemetry not exposed by macOS",
+                details: "External meter input inactive (see README)",
+                updatedAt: updatedAt
             )
         }
 
@@ -81,9 +198,10 @@ private final class BatteryPowerReader {
         let telemetryBatteryWatts = telemetry.flatMap { dictionary in
             doubleValue(dictionary["BatteryPower"]).map { $0 / 1_000 }
         }
-        let systemWatts = telemetry.flatMap { dictionary in
+        let nativeSystemWatts = telemetry.flatMap { dictionary in
             doubleValue(dictionary["SystemLoad"]).flatMap { $0 > 0 ? $0 / 1_000 : nil }
         } ?? (!pluggedIn ? telemetryBatteryWatts.map(abs) : nil)
+        let systemWatts = externalSample?.watts ?? nativeSystemWatts
         let adapterInputWatts = telemetry.flatMap { dictionary in
             doubleValue(dictionary["SystemPowerIn"]).flatMap { $0 > 0 ? $0 / 1_000 : nil }
         }
@@ -120,6 +238,22 @@ private final class BatteryPowerReader {
         if let voltage {
             detailParts.append(String(format: "Battery %.2f V", voltage / 1_000))
         }
+        if let externalSample {
+            detailParts.append(
+                String(format: "External meter %.1f s old", externalSample.ageSeconds)
+            )
+        }
+
+        let source: String
+        if externalSample != nil {
+            source = "External whole-device meter"
+        } else if telemetry?["SystemLoad"] != nil {
+            source = "macOS system load telemetry"
+        } else if !pluggedIn, telemetryBatteryWatts != nil {
+            source = "Battery discharge rate (whole-device estimate)"
+        } else {
+            source = "Whole-device telemetry unavailable"
+        }
 
         return PowerReading(
             systemWatts: systemWatts,
@@ -127,9 +261,9 @@ private final class BatteryPowerReader {
             batteryPercent: percent,
             powerState: powerState,
             batteryFlowWatts: batteryFlowWatts,
-            source: telemetry?["SystemLoad"] == nil ? "Battery power estimate" : "System load telemetry",
+            source: source,
             details: detailParts.isEmpty ? "No battery details available" : detailParts.joined(separator: " | "),
-            updatedAt: Date()
+            updatedAt: updatedAt
         )
     }
 
@@ -256,10 +390,16 @@ private final class GPUReader {
     }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let reader = BatteryPowerReader()
+private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let reader = SystemPowerReader()
     private let gpuReader = GPUReader()
     private let activeAppReader = ActiveAppReader()
+    private let activeAppRefreshInterval: TimeInterval = 15
+    private let energyPersistenceInterval: TimeInterval = 30
+    private let statusFont = NSFont.monospacedDigitSystemFont(
+        ofSize: NSFont.systemFontSize,
+        weight: .regular
+    )
     private let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .none
@@ -273,6 +413,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestReading: PowerReading?
     private var latestGPUWatts: Double?
     private var latestActiveApps: [ActiveApp] = []
+    private var energyAccumulator = EnergyAccumulator(wattHours: 0, activeSeconds: 0)
+    private var lastActiveAppRefresh: Date?
+    private var lastEnergyPersistence: Date?
+    private var lastStatusSignature: String?
+    private var menuIsOpen = false
+    private var menuHasBeenBuilt = false
+    private var energyUsageLoaded = false
+    private lazy var statusAttributes: [NSAttributedString.Key: Any] = [.font: statusFont]
+    private lazy var cpuStatusIcon = statusIconAttachment(.cpu, font: statusFont)
+    private lazy var gpuStatusIcon = statusIconAttachment(.gpu, font: statusFont)
 
     private var refreshInterval: TimeInterval {
         get {
@@ -311,6 +461,43 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private var trackEnergyUsage: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: DefaultsKey.trackEnergyUsage)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.trackEnergyUsage)
+        }
+    }
+
+    private var southAfricaTariff: Double {
+        get {
+            let defaults = UserDefaults.standard
+            guard defaults.object(forKey: DefaultsKey.southAfricaTariff) != nil else {
+                return DefaultTariff.southAfricaRandPerKWh
+            }
+            let value = defaults.double(forKey: DefaultsKey.southAfricaTariff)
+            return value.isFinite && value > 0 ? value : DefaultTariff.southAfricaRandPerKWh
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.southAfricaTariff)
+        }
+    }
+
+    private var unitedKingdomTariff: Double {
+        get {
+            let defaults = UserDefaults.standard
+            guard defaults.object(forKey: DefaultsKey.unitedKingdomTariff) != nil else {
+                return DefaultTariff.unitedKingdomPoundsPerKWh
+            }
+            let value = defaults.double(forKey: DefaultsKey.unitedKingdomTariff)
+            return value.isFinite && value > 0 ? value : DefaultTariff.unitedKingdomPoundsPerKWh
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.unitedKingdomTariff)
+        }
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? "local.codex.wattbar"
         let currentPID = ProcessInfo.processInfo.processIdentifier
@@ -328,6 +515,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
+        energyAccumulator = EnergyAccumulator(
+            wattHours: UserDefaults.standard.double(forKey: DefaultsKey.accumulatedEnergyWh),
+            activeSeconds: UserDefaults.standard.double(forKey: DefaultsKey.accumulatedTrackingSeconds)
+        )
+        energyUsageLoaded = true
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.button?.toolTip = "WattBar"
 
@@ -335,10 +527,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleTimer()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        persistEnergyUsage(force: true)
+    }
+
     @objc private func refresh() {
-        latestReading = reader.read()
+        let reading = reader.read(
+            maximumExternalAge: max(15, refreshInterval * 2.5)
+        )
+        updateEnergyUsage(with: reading)
+        latestReading = reading
         latestGPUWatts = gpuReader.read()
-        latestActiveApps = showActiveApps ? activeAppReader.topApps() : []
+        if menuIsOpen {
+            refreshActiveAppsIfNeeded(minimumAge: activeAppRefreshInterval)
+        }
         rebuildMenu()
         updateStatusTitle()
     }
@@ -356,6 +558,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleActiveApps() {
         showActiveApps.toggle()
+        if showActiveApps {
+            lastActiveAppRefresh = nil
+        } else {
+            latestActiveApps = []
+        }
         refresh()
     }
 
@@ -369,6 +576,72 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         showChargingRate.toggle()
         rebuildMenu()
         updateStatusTitle()
+    }
+
+    @objc private func toggleEnergyUsage() {
+        trackEnergyUsage.toggle()
+        if !trackEnergyUsage {
+            energyAccumulator.pause()
+            persistEnergyUsage(force: true)
+        }
+        refresh()
+    }
+
+    @objc private func editTariffs() {
+        let alert = NSAlert()
+        alert.messageText = "Electricity Tariffs"
+        alert.informativeText = """
+        Enter the unit rates from your electricity bills. Cost totals exclude standing charges.
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+
+        let randField = NSTextField(string: String(format: "%.4f", southAfricaTariff))
+        let poundsField = NSTextField(string: String(format: "%.4f", unitedKingdomTariff))
+        randField.placeholderString = "Rand per kWh"
+        poundsField.placeholderString = "Pounds per kWh"
+
+        let grid = NSGridView(views: [
+            [NSTextField(labelWithString: "South Africa (R/kWh):"), randField],
+            [NSTextField(labelWithString: "UK (£/kWh):"), poundsField]
+        ])
+        grid.rowSpacing = 8
+        grid.columnSpacing = 10
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = 130
+        grid.frame = NSRect(x: 0, y: 0, width: 330, height: 52)
+        alert.accessoryView = grid
+
+        while alert.runModal() == .alertFirstButtonReturn {
+            guard let randRate = positiveDecimal(from: randField.stringValue),
+                  let poundsRate = positiveDecimal(from: poundsField.stringValue) else {
+                showAlert(
+                    title: "Invalid Tariff",
+                    message: "Enter a number greater than zero for both per-kWh rates."
+                )
+                continue
+            }
+
+            southAfricaTariff = randRate
+            unitedKingdomTariff = poundsRate
+            rebuildMenu()
+            return
+        }
+    }
+
+    @objc private func resetEnergyUsage() {
+        let alert = NSAlert()
+        alert.messageText = "Reset tracked usage?"
+        alert.informativeText = "This resets tracking time, accumulated watt-hours, and both cost totals to zero."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        energyAccumulator.reset()
+        persistEnergyUsage(force: true)
+        refresh()
     }
 
     @objc private func toggleOpenAtLogin() {
@@ -392,9 +665,64 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func scheduleTimer() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        timer.tolerance = min(0.5, refreshInterval * 0.1)
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func refreshActiveAppsIfNeeded(minimumAge: TimeInterval) {
+        guard showActiveApps else {
+            latestActiveApps = []
+            return
+        }
+
+        let now = Date()
+        if let lastActiveAppRefresh,
+           now.timeIntervalSince(lastActiveAppRefresh) < minimumAge {
+            return
+        }
+
+        latestActiveApps = activeAppReader.topApps()
+        lastActiveAppRefresh = now
+    }
+
+    private func updateEnergyUsage(with reading: PowerReading) {
+        guard trackEnergyUsage else {
+            energyAccumulator.pause()
+            return
+        }
+
+        // Do not infer energy across app downtime, sleep, or a missing sensor
+        // interval. A delayed timer can span at most 2.5 normal refresh periods.
+        let maximumInterval = max(5, refreshInterval * 2.5)
+        energyAccumulator.addSample(
+            watts: reading.systemWatts,
+            at: reading.updatedAt,
+            maximumInterval: maximumInterval
+        )
+        persistEnergyUsage(at: reading.updatedAt)
+    }
+
+    private func persistEnergyUsage(force: Bool = false, at date: Date = Date()) {
+        guard energyUsageLoaded else { return }
+        if !force,
+           let lastEnergyPersistence,
+           date.timeIntervalSince(lastEnergyPersistence) < energyPersistenceInterval {
+            return
+        }
+
+        UserDefaults.standard.set(
+            energyAccumulator.wattHours,
+            forKey: DefaultsKey.accumulatedEnergyWh
+        )
+        UserDefaults.standard.set(
+            energyAccumulator.activeSeconds,
+            forKey: DefaultsKey.accumulatedTrackingSeconds
+        )
+        lastEnergyPersistence = date
     }
 
     private func updateStatusTitle() {
@@ -411,14 +739,26 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 batteryFlowWatts: reading.batteryFlowWatts
             )
             : nil
-        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let gpuTooltip = latestGPUWatts.map { String(format: "%.1f W", $0) } ?? "unavailable"
+        let batteryTooltip = formatBatteryFlow(reading.batteryFlowWatts)
+        let signature = [
+            showMenuBarLabel ? "label" : "no-label",
+            wattsValue,
+            gpuValue,
+            powerFlowText ?? "no-flow",
+            batteryTooltip
+        ].joined(separator: "|")
+        guard signature != lastStatusSignature else { return }
+        lastStatusSignature = signature
+
+        let font = statusFont
+        let attributes = statusAttributes
         let attributedTitle = NSMutableAttributedString()
 
         if showMenuBarLabel {
             attributedTitle.append(NSAttributedString(string: "WattBar ", attributes: attributes))
         }
-        attributedTitle.append(statusIconAttachment(.cpu, font: font))
+        attributedTitle.append(cpuStatusIcon)
         attributedTitle.append(NSAttributedString(string: " \(wattsValue)", attributes: attributes))
 
         if let powerFlowText {
@@ -433,7 +773,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         attributedTitle.append(NSAttributedString(string: " | ", attributes: attributes))
-        attributedTitle.append(statusIconAttachment(.gpu, font: font))
+        attributedTitle.append(gpuStatusIcon)
         attributedTitle.append(NSAttributedString(string: " \(gpuValue)", attributes: attributes))
 
         let accessibleParts = ["System \(wattsValue)", powerFlowText, "GPU \(gpuValue)"].compactMap { $0 }
@@ -446,13 +786,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.button?.title = accessibleTitle
         statusItem?.button?.attributedTitle = attributedTitle
         statusItem?.button?.setAccessibilityLabel("WattBar \(accessibleTitle)")
-        let gpuTooltip = latestGPUWatts.map { String(format: "%.1f W", $0) } ?? "unavailable"
-        let batteryTooltip = formatBatteryFlow(reading.batteryFlowWatts)
         statusItem?.button?.toolTip = "System draw: \(wattsValue) | Battery: \(batteryTooltip) | GPU: \(gpuTooltip)"
     }
 
-    private func rebuildMenu() {
-        let menu = NSMenu(title: "WattBar")
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        refreshActiveAppsIfNeeded(minimumAge: 5)
+        rebuildMenu(force: true)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+    }
+
+    private func rebuildMenu(force: Bool = false) {
+        let menu: NSMenu
+        if let existingMenu = statusItem?.menu {
+            menu = existingMenu
+        } else {
+            menu = NSMenu(title: "WattBar")
+            menu.delegate = self
+            statusItem?.menu = menu
+        }
+
+        guard force || menuIsOpen || !menuHasBeenBuilt else { return }
+        menu.removeAllItems()
 
         if let reading = latestReading {
             addInfo("System draw: \(formatWatts(reading.systemWatts))", to: menu)
@@ -460,12 +818,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             addInfo("GPU draw: \(formatGPUWatts(latestGPUWatts))", to: menu)
             addInfo("Power: \(reading.powerState)", to: menu)
             addInfo("Battery flow: \(formatBatteryFlow(reading.batteryFlowWatts))", to: menu)
-            addInfo("Source: \(reading.source)", to: menu)
+            addInfo("Whole-device source: \(reading.source)", to: menu)
             addInfo("Details: \(reading.details)", to: menu)
             addInfo("Updated: \(formatter.string(from: reading.updatedAt))", to: menu)
         } else {
             addInfo("WattBar is measuring...", to: menu)
         }
+
+        menu.addItem(.separator())
+        addEnergySection(to: menu)
 
         menu.addItem(.separator())
         addInfo("Top active apps (CPU, not exact watts)", to: menu)
@@ -534,13 +895,136 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
 
-        statusItem?.menu = menu
+        menuHasBeenBuilt = true
     }
 
     private func addInfo(_ title: String, to menu: NSMenu) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         menu.addItem(item)
+    }
+
+    private func addEnergySection(to menu: NSMenu) {
+        let energyUsageItem = NSMenuItem(
+            title: "Track Energy Usage & Cost",
+            action: #selector(toggleEnergyUsage),
+            keyEquivalent: ""
+        )
+        energyUsageItem.target = self
+        energyUsageItem.state = trackEnergyUsage ? .on : .off
+        menu.addItem(energyUsageItem)
+
+        if trackEnergyUsage {
+            let summaryItem = NSMenuItem()
+            summaryItem.view = energySummaryView()
+            menu.addItem(summaryItem)
+        }
+
+        let tariffItem = NSMenuItem(
+            title: "Electricity Tariffs…",
+            action: #selector(editTariffs),
+            keyEquivalent: ""
+        )
+        tariffItem.target = self
+        tariffItem.indentationLevel = 1
+        menu.addItem(tariffItem)
+
+        let resetEnergyItem = NSMenuItem(
+            title: "Reset Tracking Totals…",
+            action: #selector(resetEnergyUsage),
+            keyEquivalent: ""
+        )
+        resetEnergyItem.target = self
+        resetEnergyItem.indentationLevel = 1
+        resetEnergyItem.isEnabled =
+            energyAccumulator.wattHours > 0 || energyAccumulator.activeSeconds > 0
+        menu.addItem(resetEnergyItem)
+    }
+
+    private func energySummaryView() -> NSView {
+        let width: CGFloat = 344
+        let height: CGFloat = 160
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let title = NSTextField(labelWithString: "Energy & cost — tracking")
+        title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = .labelColor
+
+        let liveValue = energyValueLabel(formatWatts(latestReading?.systemWatts))
+        let energyValue = energyValueLabel(formatEnergySummary(energyAccumulator.wattHours))
+        let durationValue = energyValueLabel(formatTrackingDuration(energyAccumulator.activeSeconds))
+        let kilowattHours = energyAccumulator.wattHours / 1_000
+        let randValue = energyValueLabel(formatRand(kilowattHours * southAfricaTariff))
+        let poundsValue = energyValueLabel(formatPounds(kilowattHours * unitedKingdomTariff))
+
+        let grid = NSGridView(views: [
+            [energyNameLabel("Live power"), liveValue],
+            [energyNameLabel("Tracking time"), durationValue],
+            [energyNameLabel("Energy used"), energyValue],
+            [energyNameLabel("South Africa cost"), randValue],
+            [energyNameLabel("United Kingdom cost"), poundsValue]
+        ])
+        grid.rowSpacing = 4
+        grid.columnSpacing = 14
+        grid.column(at: 0).xPlacement = .leading
+        grid.column(at: 1).xPlacement = .trailing
+
+        let tariffNote = NSTextField(
+            labelWithString: String(
+                format: "Rates: R %.4f/kWh and £%.4f/kWh",
+                southAfricaTariff,
+                unitedKingdomTariff
+            )
+        )
+        tariffNote.font = NSFont.systemFont(ofSize: 10)
+        tariffNote.textColor = .secondaryLabelColor
+
+        let standingChargeNote = NSTextField(labelWithString: "Standing charges excluded")
+        standingChargeNote.font = NSFont.systemFont(ofSize: 10)
+        standingChargeNote.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [title, grid, tariffNote, standingChargeNote])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.setCustomSpacing(7, after: title)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            grid.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+
+        container.setAccessibilityElement(true)
+        container.setAccessibilityLabel(
+            """
+            Energy tracking. Live power \(liveValue.stringValue). \
+            Tracking time \(durationValue.stringValue). \
+            Energy used \(energyValue.stringValue). \
+            South Africa cost \(randValue.stringValue). \
+            United Kingdom cost \(poundsValue.stringValue).
+            """
+        )
+        return container
+    }
+
+    private func energyNameLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        return label
+    }
+
+    private func energyValueLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        label.textColor = .labelColor
+        label.alignment = .right
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return label
     }
 
     private func showAlert(title: String, message: String) {
@@ -580,6 +1064,14 @@ private func boolValue(_ value: Any?) -> Bool? {
     }
 }
 
+private func positiveDecimal(from text: String) -> Double? {
+    let normalized = text
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: ",", with: ".")
+    guard let value = Double(normalized), value.isFinite, value > 0 else { return nil }
+    return value
+}
+
 private func formatWatts(_ watts: Double?) -> String {
     guard let watts else { return "unavailable" }
     return String(format: "%.1f W", watts)
@@ -587,6 +1079,44 @@ private func formatWatts(_ watts: Double?) -> String {
 
 private func formatWholeWatts(_ watts: Double) -> String {
     String(format: "%.0f W", watts)
+}
+
+private func formatEnergySummary(_ wattHours: Double) -> String {
+    let kilowattHours = wattHours / 1_000
+    if wattHours < 1 {
+        return String(format: "%.3f Wh · %.5f kWh", wattHours, kilowattHours)
+    }
+    if wattHours < 1_000 {
+        return String(format: "%.2f Wh · %.4f kWh", wattHours, kilowattHours)
+    }
+    return String(format: "%.3f kWh", kilowattHours)
+}
+
+private func formatTrackingDuration(_ seconds: TimeInterval) -> String {
+    let totalSeconds = max(0, Int(seconds.rounded(.down)))
+    let days = totalSeconds / 86_400
+    let hours = (totalSeconds % 86_400) / 3_600
+    let minutes = (totalSeconds % 3_600) / 60
+    let remainingSeconds = totalSeconds % 60
+
+    if days > 0 {
+        return "\(days)d \(hours)h \(minutes)m"
+    }
+    if hours > 0 {
+        return "\(hours)h \(minutes)m"
+    }
+    if minutes > 0 {
+        return "\(minutes)m \(remainingSeconds)s"
+    }
+    return "\(remainingSeconds)s"
+}
+
+private func formatRand(_ rand: Double) -> String {
+    rand < 0.01 ? String(format: "R %.4f", rand) : String(format: "R %.2f", rand)
+}
+
+private func formatPounds(_ pounds: Double) -> String {
+    pounds < 0.01 ? String(format: "£%.4f", pounds) : String(format: "£%.2f", pounds)
 }
 
 private func formatBatteryFlow(_ watts: Double?) -> String {

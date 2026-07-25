@@ -4,3 +4,4 @@ backups/
 Tools/bin/
 *.o
 *.dSYM/
+WattBar.Windows.exe
