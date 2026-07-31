@@ -63,7 +63,8 @@ The current Windows build also identifies the three installed monitor models,
 uses DDC/CI to detect whether each one is on or asleep, and adds its appropriate
 researched wattage to the PC estimate. It provides persisted tracking time and
 Wh/kWh totals, South Africa and United Kingdom costs, editable tariffs,
-selectable refresh intervals, and reset controls. See
+selectable refresh intervals, six-month bounded power history with time-of-day
+summaries, and reset controls. See
 [the Windows-specific documentation](Sources/WattBar.Windows/README.md) for
 telemetry limitations and packaging details.
 

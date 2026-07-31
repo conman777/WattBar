@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
@@ -301,6 +302,182 @@ namespace WattBar.WindowsApp
         }
     }
 
+    internal sealed class PowerHistoryForm : Form
+    {
+        private const int RecentDisplayCount = 288;
+
+        public PowerHistoryForm(
+            IList<PowerHistorySample> samples,
+            string currentSource)
+        {
+            Text = "WattBar — Power History";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(780, 620);
+            BackColor = GlassPalette.Canvas;
+            ForeColor = GlassPalette.Text;
+            Font = new Font("Segoe UI", 9F);
+
+            Label title = new Label
+            {
+                Text = "POWER HISTORY",
+                Location = new Point(20, 18),
+                Size = new Size(300, 28),
+                Font = new Font("Segoe UI Semibold", 15F, FontStyle.Bold),
+                ForeColor = GlassPalette.Text
+            };
+            Controls.Add(title);
+
+            Label context = new Label
+            {
+                Text = String.Format(
+                    "Six-month retention  •  {0} samples  •  Current source: {1}",
+                    samples.Count,
+                    String.IsNullOrEmpty(currentSource) ? "unavailable" : currentSource),
+                Location = new Point(20, 49),
+                Size = new Size(740, 24),
+                ForeColor = GlassPalette.Muted,
+                AutoEllipsis = true
+            };
+            Controls.Add(context);
+
+            Label summaryTitle = SectionLabel("TIME-OF-DAY SUMMARY", 20, 82);
+            Controls.Add(summaryTitle);
+            ListView summary = CreateListView(
+                new string[] { "Period", "Samples", "Average", "Peak" },
+                new int[] { 190, 90, 120, 120 });
+            summary.Location = new Point(20, 108);
+            summary.Size = new Size(520, 130);
+            PowerHistoryPeriodSummary[] periods = PowerHistoryAnalyzer.ByTimeOfDay(samples);
+            for (int index = 0; index < periods.Length; index++)
+            {
+                PowerHistoryPeriodSummary period = periods[index];
+                summary.Items.Add(new ListViewItem(new string[]
+                {
+                    period.Label,
+                    period.SampleCount.ToString(),
+                    period.SampleCount > 0
+                        ? String.Format("{0:F1} W", period.AverageWatts)
+                        : "—",
+                    period.SampleCount > 0
+                        ? String.Format("{0:F1} W", period.PeakWatts)
+                        : "—"
+                }));
+            }
+            Controls.Add(summary);
+
+            PowerHistorySample peak = PowerHistoryAnalyzer.Peak(samples);
+            Label peakLabel = new Label
+            {
+                Text = peak == null
+                    ? "No valid tracked power samples are available yet."
+                    : String.Format(
+                        "Highest recorded: {0:F1} W at {1}  •  {2}",
+                        peak.Watts,
+                        peak.TimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                        peak.Source),
+                Location = new Point(20, 248),
+                Size = new Size(740, 24),
+                ForeColor = peak == null ? GlassPalette.Warning : GlassPalette.Accent,
+                AutoEllipsis = true
+            };
+            Controls.Add(peakLabel);
+
+            Label recentTitle = SectionLabel(
+                String.Format("RECENT SAMPLES  •  LATEST {0}", RecentDisplayCount),
+                20,
+                282);
+            Controls.Add(recentTitle);
+            ListView recent = CreateListView(
+                new string[] { "Local time", "Watts", "Source" },
+                new int[] { 180, 100, 390 });
+            recent.Location = new Point(20, 308);
+            recent.Size = new Size(740, 250);
+            List<PowerHistorySample> recentSamples = PowerHistoryAnalyzer.Recent(
+                samples,
+                RecentDisplayCount);
+            if (recentSamples.Count == 0)
+            {
+                recent.Items.Add(new ListViewItem(
+                    "No valid tracked power samples yet."));
+            }
+            else
+            {
+                for (int index = 0; index < recentSamples.Count; index++)
+                {
+                    PowerHistorySample sample = recentSamples[index];
+                    recent.Items.Add(new ListViewItem(new string[]
+                    {
+                        sample.TimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                        String.Format("{0:F1} W", sample.Watts),
+                        sample.Source
+                    }));
+                }
+            }
+            Controls.Add(recent);
+
+            Label note = new Label
+            {
+                Text = "History records the tracked total only when a power source is available; gaps mean telemetry was unavailable or WattBar was not sampling.",
+                Location = new Point(20, 570),
+                Size = new Size(620, 24),
+                ForeColor = GlassPalette.Muted,
+                AutoEllipsis = true
+            };
+            Controls.Add(note);
+
+            Button close = new Button
+            {
+                Text = "Close",
+                DialogResult = DialogResult.Cancel,
+                Location = new Point(665, 566),
+                Size = new Size(95, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = GlassPalette.Accent,
+                ForeColor = GlassPalette.Canvas
+            };
+            close.FlatAppearance.BorderColor = GlassPalette.Accent;
+            Controls.Add(close);
+            CancelButton = close;
+        }
+
+        private static Label SectionLabel(string text, int x, int y)
+        {
+            return new Label
+            {
+                Text = text,
+                Location = new Point(x, y),
+                Size = new Size(520, 20),
+                Font = new Font("Segoe UI Semibold", 8F, FontStyle.Bold),
+                ForeColor = GlassPalette.Accent
+            };
+        }
+
+        private static ListView CreateListView(string[] columns, int[] widths)
+        {
+            ListView list = new ListView
+            {
+                View = View.Details,
+                FullRowSelect = true,
+                GridLines = true,
+                HideSelection = false,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable,
+                BackColor = GlassPalette.GlassSurface,
+                ForeColor = GlassPalette.Text,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Segoe UI", 8.5F)
+            };
+            for (int index = 0; index < columns.Length; index++)
+            {
+                list.Columns.Add(columns[index], widths[index]);
+            }
+            return list;
+        }
+    }
+
     internal static class WindowBackdrop
     {
         [DllImport("dwmapi.dll")]
@@ -361,8 +538,10 @@ namespace WattBar.WindowsApp
         private readonly MetricCard _energyCard;
         private readonly GlassButton _trackingButton;
         private readonly GlassButton _refreshButton;
+        private readonly GlassButton _historyButton;
         private readonly GlassButton _tariffsButton;
         private readonly GlassButton _resetButton;
+        private readonly Label _historyStatus;
         private readonly GlassButton[] _intervalButtons;
         private readonly Label[] _displayNameLabels;
         private readonly Label[] _displayValueLabels;
@@ -373,6 +552,7 @@ namespace WattBar.WindowsApp
         private bool _allowClose;
 
         public event EventHandler RefreshRequested;
+        public event EventHandler HistoryRequested;
         public event EventHandler TrackingToggled;
         public event EventHandler TariffsRequested;
         public event EventHandler ResetRequested;
@@ -582,16 +762,36 @@ namespace WattBar.WindowsApp
             GlassPanel controls = new GlassPanel
             {
                 Location = new Point(24, 456),
-                Size = new Size(548, 136)
+                Size = new Size(548, 156)
             };
             _trackingButton = MakeButton("START TRACKING", 20, 20, 140, true);
             _refreshButton = MakeButton("REFRESH", 172, 20, 100, false);
             _tariffsButton = MakeButton("TARIFFS", 284, 20, 100, false);
-            _resetButton = MakeButton("RESET", 396, 20, 100, false);
+            _historyButton = MakeButton("POWER HISTORY", 396, 20, 100, false);
+            _historyButton.Font = new Font("Segoe UI Semibold", 7.5F, FontStyle.Bold);
+            _resetButton = MakeButton("RESET", 20, 64, 100, false);
+            Label historyTitle = MakeLabel(
+                "POWER HISTORY",
+                132,
+                62,
+                180,
+                18,
+                8F,
+                GlassPalette.Accent,
+                true);
+            _historyStatus = MakeLabel(
+                "RETAINED 6 MONTHS  •  NO SAMPLES YET",
+                132,
+                82,
+                364,
+                18,
+                7.5F,
+                GlassPalette.Muted,
+                true);
             _costSummary = MakeLabel(
                 "TRACKED COST  •  R 0.00  •  £0.00",
                 20,
-                80,
+                114,
                 504,
                 22,
                 8F,
@@ -600,7 +800,10 @@ namespace WattBar.WindowsApp
             controls.Controls.Add(_trackingButton);
             controls.Controls.Add(_refreshButton);
             controls.Controls.Add(_tariffsButton);
+            controls.Controls.Add(_historyButton);
             controls.Controls.Add(_resetButton);
+            controls.Controls.Add(historyTitle);
+            controls.Controls.Add(_historyStatus);
             controls.Controls.Add(_costSummary);
 
             Label summaryTitle = MakeLabel(
@@ -753,6 +956,7 @@ namespace WattBar.WindowsApp
 
             _trackingButton.Click += delegate { Raise(TrackingToggled); };
             _refreshButton.Click += delegate { Raise(RefreshRequested); };
+            _historyButton.Click += delegate { Raise(HistoryRequested); };
             _tariffsButton.Click += delegate { Raise(TariffsRequested); };
             _resetButton.Click += delegate { Raise(ResetRequested); };
         }
@@ -760,7 +964,8 @@ namespace WattBar.WindowsApp
         public void UpdateDashboard(
             PowerReading reading,
             SettingsData settings,
-            EnergyAccumulator accumulator)
+            EnergyAccumulator accumulator,
+            IList<PowerHistorySample> history)
         {
             _updated.Text = "UPDATED  " + reading.TimestampUtc.ToLocalTime().ToString("HH:mm:ss");
             _uptime.Text = "SYSTEM UPTIME  " +
@@ -848,6 +1053,16 @@ namespace WattBar.WindowsApp
             _energyCard.Value = accumulator.WattHours < 1000
                 ? String.Format("{0:F1} Wh", accumulator.WattHours)
                 : String.Format("{0:F2} kWh", kilowattHours);
+            PowerHistorySample peak = PowerHistoryAnalyzer.Peak(history);
+            _historyStatus.Text = peak == null
+                ? "RETAINED 6 MONTHS  •  NO SAMPLES YET"
+                : String.Format(
+                    "RETAINED 6 MONTHS  •  {0:N0} SAMPLES  •  PEAK {1:F1} W",
+                    history.Count,
+                    peak.Watts);
+            _historyStatus.ForeColor = peak == null
+                ? GlassPalette.Warning
+                : GlassPalette.Accent;
             double liveKilowatts = reading.TrackedWatts.GetValueOrDefault() / 1000.0;
             _costSummary.Text = "NOW  " +
                 WattBarContext.FormatRand(liveKilowatts * settings.SouthAfricaTariff) +

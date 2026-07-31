@@ -15,6 +15,13 @@ Right-click the tray icon for quick actions.
 The dashboard header and tray menu show the computer's current uptime in a
 compact days/hours/minutes format, such as `5d 3h 12m`.
 
+Choose `HISTORY` in the dashboard or `View power history` in the tray menu to
+inspect recent tracked-power samples, four time-of-day average/peak summaries,
+and the highest recorded sample. History is sampled at most every five minutes,
+retained for six calendar months, and capped at 55,000 samples. A sample's
+source is shown explicitly; unavailable readings are left as gaps rather than
+invented values.
+
 Requirements:
 
 - Windows 10 or Windows 11
@@ -118,5 +125,8 @@ Tracking settings and totals are stored locally at:
 ```text
 %LOCALAPPDATA%\WattBar\settings.json
 ```
+
+The power history is stored in the same file and is automatically migrated from
+older settings files that do not contain history.
 
 No telemetry leaves the computer.

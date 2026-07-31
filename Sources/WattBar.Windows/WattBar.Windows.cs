@@ -24,6 +24,7 @@ namespace WattBar.WindowsApp
         [DataMember] public bool? AsusDisplayEnabled;
         [DataMember] public bool? Lg24DisplayEnabled;
         [DataMember] public bool? Lg27DisplayEnabled;
+        [DataMember] public List<PowerHistorySample> PowerHistory;
 
         public static SettingsData CreateDefault()
         {
@@ -37,7 +38,8 @@ namespace WattBar.WindowsApp
                 UnitedKingdomTariff = 0.2611,
                 AsusDisplayEnabled = true,
                 Lg24DisplayEnabled = true,
-                Lg27DisplayEnabled = true
+                Lg27DisplayEnabled = true,
+                PowerHistory = new List<PowerHistorySample>()
             };
         }
 
@@ -76,6 +78,15 @@ namespace WattBar.WindowsApp
             {
                 Lg27DisplayEnabled = true;
             }
+            if (PowerHistory == null)
+            {
+                PowerHistory = new List<PowerHistorySample>();
+            }
+            List<PowerHistorySample> normalizedHistory = PowerHistoryPolicy.Normalize(
+                PowerHistory,
+                DateTime.UtcNow);
+            PowerHistory.Clear();
+            PowerHistory.AddRange(normalizedHistory);
         }
 
         public bool IsDisplayEnabled(int index)
@@ -116,6 +127,70 @@ namespace WattBar.WindowsApp
         private static bool IsFinitePositive(double value)
         {
             return !Double.IsNaN(value) && !Double.IsInfinity(value) && value > 0;
+        }
+    }
+
+    [DataContract]
+    internal sealed class PowerHistorySample
+    {
+        [DataMember] public DateTime TimestampUtc;
+        [DataMember] public double Watts;
+        [DataMember] public string Source;
+    }
+
+    internal static class PowerHistoryPolicy
+    {
+        public const int RetentionMonths = 6;
+        public const int MaximumSamples = 55000;
+        public const int MinimumIntervalSeconds = 300;
+
+        public static List<PowerHistorySample> Normalize(
+            List<PowerHistorySample> samples,
+            DateTime nowUtc)
+        {
+            DateTime referenceUtc = nowUtc.ToUniversalTime();
+            DateTime oldestAllowed = referenceUtc.AddMonths(-RetentionMonths);
+            DateTime newestAllowed = referenceUtc.AddMinutes(5);
+            List<PowerHistorySample> valid = new List<PowerHistorySample>();
+            for (int index = 0; index < samples.Count; index++)
+            {
+                PowerHistorySample sample = samples[index];
+                if (sample == null)
+                {
+                    continue;
+                }
+
+                DateTime timestamp = sample.TimestampUtc.ToUniversalTime();
+                if (timestamp < oldestAllowed || timestamp > newestAllowed ||
+                    !IsFiniteNonNegative(sample.Watts))
+                {
+                    continue;
+                }
+
+                valid.Add(new PowerHistorySample
+                {
+                    TimestampUtc = timestamp,
+                    Watts = sample.Watts,
+                    Source = String.IsNullOrEmpty(sample.Source)
+                        ? "Unknown source"
+                        : sample.Source
+                });
+            }
+
+            valid.Sort(delegate(PowerHistorySample left, PowerHistorySample right)
+            {
+                return left.TimestampUtc.CompareTo(right.TimestampUtc);
+            });
+            while (valid.Count > MaximumSamples)
+            {
+                valid.RemoveAt(0);
+            }
+            return valid;
+        }
+
+        private static bool IsFiniteNonNegative(double value)
+        {
+            return !Double.IsNaN(value) && !Double.IsInfinity(value) && value >= 0;
         }
     }
 
@@ -1275,6 +1350,151 @@ namespace WattBar.WindowsApp
         }
     }
 
+    internal sealed class PowerHistoryTracker
+    {
+        private readonly List<PowerHistorySample> _samples;
+
+        public IList<PowerHistorySample> Samples
+        {
+            get { return _samples; }
+        }
+
+        public PowerHistoryTracker(List<PowerHistorySample> samples)
+        {
+            _samples = samples ?? new List<PowerHistorySample>();
+        }
+
+        public bool TryAdd(PowerReading reading)
+        {
+            if (!reading.TrackedWatts.HasValue ||
+                !IsFiniteNonNegative(reading.TrackedWatts.Value))
+            {
+                return false;
+            }
+
+            DateTime timestampUtc = reading.TimestampUtc.ToUniversalTime();
+            if (_samples.Count > 0)
+            {
+                DateTime previousTimestamp = _samples[_samples.Count - 1].TimestampUtc;
+                if ((timestampUtc - previousTimestamp).TotalSeconds <
+                    PowerHistoryPolicy.MinimumIntervalSeconds)
+                {
+                    return false;
+                }
+            }
+
+            _samples.Add(new PowerHistorySample
+            {
+                TimestampUtc = timestampUtc,
+                Watts = reading.TrackedWatts.Value,
+                Source = DescribeSource(reading)
+            });
+
+            List<PowerHistorySample> normalized = PowerHistoryPolicy.Normalize(
+                _samples,
+                timestampUtc);
+            _samples.Clear();
+            _samples.AddRange(normalized);
+            return true;
+        }
+
+        internal static string DescribeSource(PowerReading reading)
+        {
+            if (reading.SystemWatts.HasValue)
+            {
+                return reading.DisplayWatts.HasValue
+                    ? "Whole-device + display estimate"
+                    : "Whole-device";
+            }
+            if (reading.ComponentWatts.HasValue)
+            {
+                return reading.DisplayWatts.HasValue
+                    ? "Component estimate + display estimate"
+                    : "Component estimate";
+            }
+            if (reading.DisplayWatts.HasValue)
+            {
+                return "Display estimate only";
+            }
+            return "Unavailable";
+        }
+
+        private static bool IsFiniteNonNegative(double value)
+        {
+            return !Double.IsNaN(value) && !Double.IsInfinity(value) && value >= 0;
+        }
+    }
+
+    internal sealed class PowerHistoryPeriodSummary
+    {
+        public string Label;
+        public int SampleCount;
+        public double TotalWatts;
+        public double PeakWatts;
+        public DateTime PeakTimestampUtc;
+
+        public double AverageWatts
+        {
+            get { return SampleCount > 0 ? TotalWatts / SampleCount : 0; }
+        }
+    }
+
+    internal static class PowerHistoryAnalyzer
+    {
+        public static List<PowerHistorySample> Recent(
+            IList<PowerHistorySample> samples,
+            int maximumSamples)
+        {
+            List<PowerHistorySample> recent = new List<PowerHistorySample>();
+            int start = Math.Max(0, samples.Count - maximumSamples);
+            for (int index = samples.Count - 1; index >= start; index--)
+            {
+                recent.Add(samples[index]);
+            }
+            return recent;
+        }
+
+        public static PowerHistorySample Peak(IList<PowerHistorySample> samples)
+        {
+            PowerHistorySample peak = null;
+            for (int index = 0; index < samples.Count; index++)
+            {
+                if (peak == null || samples[index].Watts > peak.Watts)
+                {
+                    peak = samples[index];
+                }
+            }
+            return peak;
+        }
+
+        public static PowerHistoryPeriodSummary[] ByTimeOfDay(
+            IList<PowerHistorySample> samples)
+        {
+            PowerHistoryPeriodSummary[] summaries = new PowerHistoryPeriodSummary[]
+            {
+                new PowerHistoryPeriodSummary { Label = "Overnight 00-06" },
+                new PowerHistoryPeriodSummary { Label = "Morning 06-12" },
+                new PowerHistoryPeriodSummary { Label = "Afternoon 12-18" },
+                new PowerHistoryPeriodSummary { Label = "Evening 18-24" }
+            };
+
+            for (int index = 0; index < samples.Count; index++)
+            {
+                PowerHistorySample sample = samples[index];
+                int period = sample.TimestampUtc.ToLocalTime().Hour / 6;
+                PowerHistoryPeriodSummary summary = summaries[period];
+                summary.SampleCount++;
+                summary.TotalWatts += sample.Watts;
+                if (summary.SampleCount == 1 || sample.Watts > summary.PeakWatts)
+                {
+                    summary.PeakWatts = sample.Watts;
+                    summary.PeakTimestampUtc = sample.TimestampUtc;
+                }
+            }
+            return summaries;
+        }
+    }
+
     internal sealed class TariffDialog : Form
     {
         private readonly NumericUpDown _randRate;
@@ -1417,6 +1637,7 @@ namespace WattBar.WindowsApp
         private readonly SettingsStore _settingsStore;
         private readonly SettingsData _settings;
         private readonly EnergyAccumulator _accumulator;
+        private readonly PowerHistoryTracker _historyTracker;
         private readonly ComponentTelemetryReader _componentTelemetry;
         private readonly MonitorTelemetryReader _monitorTelemetry;
         private readonly NotifyIcon _notifyIcon;
@@ -1442,12 +1663,14 @@ namespace WattBar.WindowsApp
             _accumulator = new EnergyAccumulator(
                 _settings.AccumulatedEnergyWh,
                 _settings.AccumulatedTrackingSeconds);
+            _historyTracker = new PowerHistoryTracker(_settings.PowerHistory);
             _componentTelemetry = new ComponentTelemetryReader();
             _monitorTelemetry = new MonitorTelemetryReader();
             _lastPersistenceUtc = DateTime.MinValue;
 
             _dashboard = new DashboardForm();
             _dashboard.RefreshRequested += delegate { RefreshReading(); };
+            _dashboard.HistoryRequested += delegate { ShowHistory(); };
             _dashboard.TrackingToggled += delegate { ToggleTracking(); };
             _dashboard.TariffsRequested += delegate { EditTariffs(); };
             _dashboard.ResetRequested += delegate { ResetTracking(); };
@@ -1492,6 +1715,9 @@ namespace WattBar.WindowsApp
             openDashboard.Font = new Font(_menu.Font, FontStyle.Bold);
             openDashboard.Click += delegate { ShowDashboard(); };
 
+            ToolStripMenuItem history = new ToolStripMenuItem("View power history");
+            history.Click += delegate { ShowHistory(); };
+
             _menuPower = StatusLabel("Measuring live power…", true);
             _menuState = StatusLabel("Checking Windows power capability", false);
             _menuState.ForeColor = Color.FromArgb(151, 166, 187);
@@ -1528,6 +1754,7 @@ namespace WattBar.WindowsApp
             exit.Click += delegate { ExitThread(); };
 
             _menu.Items.Add(openDashboard);
+            _menu.Items.Add(history);
             _menu.Items.Add(_menuPower);
             _menu.Items.Add(_menuState);
             _menu.Items.Add(_menuUptime);
@@ -1562,6 +1789,7 @@ namespace WattBar.WindowsApp
             _timer.Tick += delegate { RefreshReading(); };
             ApplyRefreshInterval();
             RefreshReading();
+            Persist(true);
             _timer.Start();
             _dashboard.ShowDashboard();
         }
@@ -1605,6 +1833,7 @@ namespace WattBar.WindowsApp
                 };
             }
             ApplyTelemetry(_latestReading, components, monitors, displayWatts);
+            bool historyChanged = _historyTracker.TryAdd(_latestReading);
 
             if (_settings.TrackEnergyUsage)
             {
@@ -1613,11 +1842,14 @@ namespace WattBar.WindowsApp
                     _latestReading.TrackedWatts,
                     _latestReading.TimestampUtc,
                     maximumInterval);
-                Persist(false);
             }
             else
             {
                 _accumulator.Pause();
+            }
+            if (historyChanged || _settings.TrackEnergyUsage)
+            {
+                Persist(false);
             }
             UpdateDisplay();
         }
@@ -1653,7 +1885,11 @@ namespace WattBar.WindowsApp
                 ? "WattBar | " + watts
                 : "WattBar | Power source needed";
             _notifyIcon.Text = tooltip.Length <= 63 ? tooltip : tooltip.Substring(0, 63);
-            _dashboard.UpdateDashboard(_latestReading, _settings, _accumulator);
+            _dashboard.UpdateDashboard(
+                _latestReading,
+                _settings,
+                _accumulator,
+                _historyTracker.Samples);
         }
 
         private static void ApplyTelemetry(
@@ -1681,6 +1917,20 @@ namespace WattBar.WindowsApp
         {
             RefreshReading();
             _dashboard.ShowDashboard();
+        }
+
+        private void ShowHistory()
+        {
+            RefreshReading();
+            string currentSource = _latestReading == null
+                ? "unavailable"
+                : _latestReading.Source;
+            using (PowerHistoryForm dialog = new PowerHistoryForm(
+                _historyTracker.Samples,
+                currentSource))
+            {
+                dialog.ShowDialog(_dashboard);
+            }
         }
 
         private void ToggleTracking()
@@ -1873,6 +2123,89 @@ namespace WattBar.WindowsApp
         {
             DateTime start = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
             if (WattBarContext.FormatDuration((5 * 86400) + (3 * 3600) + (12 * 60)) != "5d 3h 12m")
+            {
+                return false;
+            }
+            List<PowerHistorySample> historySamples = new List<PowerHistorySample>();
+            PowerHistoryTracker historyTracker = new PowerHistoryTracker(historySamples);
+            PowerReading wholeDeviceReading = new PowerReading
+            {
+                TrackedWatts = 175,
+                SystemWatts = 150,
+                DisplayWatts = 25,
+                TimestampUtc = start
+            };
+            if (!historyTracker.TryAdd(wholeDeviceReading) ||
+                historySamples.Count != 1 ||
+                historySamples[0].Source != "Whole-device + display estimate")
+            {
+                return false;
+            }
+            wholeDeviceReading.TimestampUtc = start.AddMinutes(4);
+            if (historyTracker.TryAdd(wholeDeviceReading))
+            {
+                return false;
+            }
+            wholeDeviceReading.TrackedWatts = 210;
+            wholeDeviceReading.TimestampUtc = start.AddMinutes(5);
+            if (!historyTracker.TryAdd(wholeDeviceReading))
+            {
+                return false;
+            }
+            PowerHistoryPeriodSummary[] periodSummaries =
+                PowerHistoryAnalyzer.ByTimeOfDay(historySamples);
+            int summarySampleCount = 0;
+            for (int index = 0; index < periodSummaries.Length; index++)
+            {
+                summarySampleCount += periodSummaries[index].SampleCount;
+            }
+            if (PowerHistoryAnalyzer.Peak(historySamples).Watts != 210 ||
+                PowerHistoryAnalyzer.Recent(historySamples, 1).Count != 1 ||
+                summarySampleCount != 2)
+            {
+                return false;
+            }
+            List<PowerHistorySample> oldHistory = new List<PowerHistorySample>
+            {
+                new PowerHistorySample
+                {
+                    TimestampUtc = start.AddMonths(-6).AddMinutes(-1),
+                    Watts = 100,
+                    Source = "old"
+                },
+                new PowerHistorySample
+                {
+                    TimestampUtc = start.AddMonths(-6).AddMinutes(1),
+                    Watts = 100,
+                    Source = "valid"
+                }
+            };
+            List<PowerHistorySample> normalizedHistory = PowerHistoryPolicy.Normalize(
+                oldHistory,
+                start);
+            if (normalizedHistory.Count != 1 || normalizedHistory[0].Source != "valid")
+            {
+                return false;
+            }
+            List<PowerHistorySample> cappedHistory = new List<PowerHistorySample>();
+            for (int index = 0; index <= PowerHistoryPolicy.MaximumSamples; index++)
+            {
+                cappedHistory.Add(new PowerHistorySample
+                {
+                    TimestampUtc = start.AddMinutes(-index),
+                    Watts = 100,
+                    Source = "test"
+                });
+            }
+            if (PowerHistoryPolicy.Normalize(cappedHistory, start).Count !=
+                PowerHistoryPolicy.MaximumSamples)
+            {
+                return false;
+            }
+            SettingsData migrationSettings = SettingsData.CreateDefault();
+            List<PowerHistorySample> historyReference = migrationSettings.PowerHistory;
+            migrationSettings.Validate();
+            if (!Object.ReferenceEquals(historyReference, migrationSettings.PowerHistory))
             {
                 return false;
             }
