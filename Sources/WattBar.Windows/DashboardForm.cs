@@ -346,6 +346,7 @@ namespace WattBar.WindowsApp
         private const int HitCaption = 0x0002;
 
         private readonly Label _updated;
+        private readonly Label _uptime;
         private readonly Label _watts;
         private readonly Label _liveCaption;
         private readonly Label _powerState;
@@ -440,13 +441,23 @@ namespace WattBar.WindowsApp
             _updated = MakeLabel(
                 "MEASURING…",
                 650,
-                20,
+                10,
                 180,
-                24,
+                18,
                 8F,
                 GlassPalette.Muted,
                 true);
             _updated.TextAlign = ContentAlignment.MiddleRight;
+            _uptime = MakeLabel(
+                "SYSTEM UPTIME  --",
+                650,
+                34,
+                180,
+                16,
+                7.5F,
+                GlassPalette.Accent,
+                true);
+            _uptime.TextAlign = ContentAlignment.MiddleRight;
 
             GlassButton minimize = new GlassButton
             {
@@ -470,6 +481,7 @@ namespace WattBar.WindowsApp
             titleBar.Controls.Add(brand);
             titleBar.Controls.Add(subtitle);
             titleBar.Controls.Add(_updated);
+            titleBar.Controls.Add(_uptime);
             titleBar.Controls.Add(minimize);
             titleBar.Controls.Add(close);
             AttachDrag(titleBar);
@@ -751,6 +763,8 @@ namespace WattBar.WindowsApp
             EnergyAccumulator accumulator)
         {
             _updated.Text = "UPDATED  " + reading.TimestampUtc.ToLocalTime().ToString("HH:mm:ss");
+            _uptime.Text = "SYSTEM UPTIME  " +
+                WattBarContext.FormatDuration(WattBarContext.SystemUptimeSeconds());
             bool wholeDeviceAvailable = reading.SystemWatts.HasValue;
             bool componentsAvailable = reading.ComponentWatts.HasValue;
             bool displaysAvailable =

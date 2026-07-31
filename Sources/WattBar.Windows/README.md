@@ -12,6 +12,9 @@ dashboard. Closing the dashboard keeps it running in the notification area.
 Left-click the tray icon or launch WattBar again to reopen the dashboard.
 Right-click the tray icon for quick actions.
 
+The dashboard header and tray menu show the computer's current uptime in a
+compact days/hours/minutes format, such as `5d 3h 12m`.
+
 Requirements:
 
 - Windows 10 or Windows 11

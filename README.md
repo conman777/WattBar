@@ -9,6 +9,7 @@ The macOS version displays:
 - Charger input reported by `SystemPowerIn`
 - Battery charging or discharging power
 - Estimated GPU power
+- Computer uptime, shown in days, hours, and minutes
 - Optional accumulated energy, tracking time, and electricity costs
 - The most active applications by CPU and memory usage
 

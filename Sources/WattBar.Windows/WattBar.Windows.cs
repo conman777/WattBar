@@ -1411,6 +1411,9 @@ namespace WattBar.WindowsApp
     {
         private const double PersistenceIntervalSeconds = 30;
 
+        [DllImport("kernel32.dll")]
+        private static extern ulong GetTickCount64();
+
         private readonly SettingsStore _settingsStore;
         private readonly SettingsData _settings;
         private readonly EnergyAccumulator _accumulator;
@@ -1423,6 +1426,7 @@ namespace WattBar.WindowsApp
         private readonly System.Windows.Forms.Timer _timer;
         private readonly ToolStripLabel _menuPower;
         private readonly ToolStripLabel _menuState;
+        private readonly ToolStripLabel _menuUptime;
         private readonly ToolStripMenuItem _track;
         private readonly ToolStripMenuItem _reset;
         private readonly ToolStripMenuItem[] _intervalItems;
@@ -1491,6 +1495,8 @@ namespace WattBar.WindowsApp
             _menuPower = StatusLabel("Measuring live power…", true);
             _menuState = StatusLabel("Checking Windows power capability", false);
             _menuState.ForeColor = Color.FromArgb(151, 166, 187);
+            _menuUptime = StatusLabel("System uptime  --", false);
+            _menuUptime.ForeColor = Color.FromArgb(151, 166, 187);
 
             _track = new ToolStripMenuItem("Start energy tracking");
             _track.Click += delegate { ToggleTracking(); };
@@ -1524,6 +1530,7 @@ namespace WattBar.WindowsApp
             _menu.Items.Add(openDashboard);
             _menu.Items.Add(_menuPower);
             _menu.Items.Add(_menuState);
+            _menu.Items.Add(_menuUptime);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_track);
             _menu.Items.Add(tariffs);
@@ -1628,6 +1635,8 @@ namespace WattBar.WindowsApp
                 ? "  •  Battery " + _latestReading.BatteryPercent.Value.ToString() + "%"
                 : "";
             _menuState.Text = _latestReading.PowerState + percent;
+            _menuUptime.Text = "System uptime  -  " +
+                WattBarContext.FormatDuration(WattBarContext.SystemUptimeSeconds());
             _track.Checked = _settings.TrackEnergyUsage;
             _track.Text = _settings.TrackEnergyUsage
                 ? "Pause energy tracking"
@@ -1791,6 +1800,11 @@ namespace WattBar.WindowsApp
             return watts.HasValue ? String.Format("{0:F1} W", watts.Value) : "unavailable";
         }
 
+        internal static double SystemUptimeSeconds()
+        {
+            return GetTickCount64() / 1000.0;
+        }
+
         internal static string FormatEnergy(double wattHours)
         {
             double kilowattHours = wattHours / 1000.0;
@@ -1858,6 +1872,10 @@ namespace WattBar.WindowsApp
         public static bool Run()
         {
             DateTime start = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            if (WattBarContext.FormatDuration((5 * 86400) + (3 * 3600) + (12 * 60)) != "5d 3h 12m")
+            {
+                return false;
+            }
             EnergyAccumulator accumulator = new EnergyAccumulator(0, 0);
             accumulator.AddSample(10, start, 4000);
             accumulator.AddSample(20, start.AddHours(1), 4000);
