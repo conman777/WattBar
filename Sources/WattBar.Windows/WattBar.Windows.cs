@@ -2122,6 +2122,18 @@ namespace WattBar.WindowsApp
         public static bool Run()
         {
             DateTime start = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            if (!DashboardForm.ShouldHideOnMinimize(
+                    FormWindowState.Minimized,
+                    false) ||
+                DashboardForm.ShouldHideOnMinimize(
+                    FormWindowState.Normal,
+                    false) ||
+                DashboardForm.ShouldHideOnMinimize(
+                    FormWindowState.Minimized,
+                    true))
+            {
+                return false;
+            }
             if (WattBarContext.FormatDuration((5 * 86400) + (3 * 3600) + (12 * 60)) != "5d 3h 12m")
             {
                 return false;

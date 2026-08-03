@@ -550,6 +550,7 @@ namespace WattBar.WindowsApp
         private int _selectedRefreshSeconds = 5;
         private int _requestedMonitorIndex;
         private bool _allowClose;
+        private bool _minimizeHidePending;
 
         public event EventHandler RefreshRequested;
         public event EventHandler HistoryRequested;
@@ -654,7 +655,7 @@ namespace WattBar.WindowsApp
                 AccentColor = Color.FromArgb(248, 113, 113),
                 Font = new Font("Segoe UI", 13F)
             };
-            minimize.Click += delegate { WindowState = FormWindowState.Minimized; };
+            minimize.Click += delegate { Hide(); };
             close.Click += delegate { Hide(); };
 
             titleBar.Controls.Add(logo);
@@ -1192,6 +1193,20 @@ namespace WattBar.WindowsApp
         protected override void OnResize(EventArgs eventArgs)
         {
             base.OnResize(eventArgs);
+            if (ShouldHideOnMinimize(WindowState, _allowClose) &&
+                !_minimizeHidePending)
+            {
+                _minimizeHidePending = true;
+                try
+                {
+                    BeginInvoke(new MethodInvoker(HideMinimizedDashboard));
+                }
+                catch (InvalidOperationException)
+                {
+                    _minimizeHidePending = false;
+                    HideMinimizedDashboard();
+                }
+            }
             if (Width <= 0 || Height <= 0)
             {
                 return;
@@ -1202,6 +1217,24 @@ namespace WattBar.WindowsApp
             {
                 Region = new Region(path);
             }
+        }
+
+        internal static bool ShouldHideOnMinimize(
+            FormWindowState state,
+            bool allowClose)
+        {
+            return state == FormWindowState.Minimized && !allowClose;
+        }
+
+        private void HideMinimizedDashboard()
+        {
+            _minimizeHidePending = false;
+            if (!ShouldHideOnMinimize(WindowState, _allowClose))
+            {
+                return;
+            }
+            WindowState = FormWindowState.Normal;
+            Hide();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs eventArgs)
