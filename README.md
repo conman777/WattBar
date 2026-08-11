@@ -9,6 +9,9 @@ The macOS version displays:
 - Charger input reported by `SystemPowerIn`
 - Battery charging or discharging power
 - Estimated GPU power
+- CPU temperature
+- Optional live download and upload speeds in the menu bar, with session totals in the menu
+- Optional compact menu-bar icon with full readings available on hover; left-click toggles compact/full mode and right-click opens the menu
 - Optional accumulated energy, tracking time, and electricity costs
 - The most active applications by CPU and memory usage
 
@@ -70,6 +73,10 @@ Watt Bar keeps whole-device and battery/adapter values separate:
 GPU power is estimated from Apple's IOReport energy counters. The top-app list
 uses CPU activity as a useful indicator; it does not assign exact watts to each
 application.
+
+CPU temperature is read from Apple's SMC CPU die/package sensors. Sensor names
+vary between Mac generations, so Watt Bar shows the value as unavailable when
+the current hardware or macOS version does not expose a supported reading.
 
 Battery and charging information is supplementary. A desktop or Mac mini is a
 normal Watt Bar target, but macOS does not provide a public, universal
@@ -138,3 +145,5 @@ an external service.
 
 The GPU estimate uses the system-provided `libIOReport` interface. This interface
 is not part of Apple's documented public SDK and may change in future macOS releases.
+The CPU temperature reader likewise uses Apple's undocumented SMC interface and
+may be unavailable or change on future hardware or macOS releases.

@@ -6,11 +6,16 @@ import ServiceManagement
 @_silgen_name("wattbar_gpu_watts")
 private func wattbar_gpu_watts() -> Double
 
+@_silgen_name("wattbar_cpu_temperature_celsius")
+private func wattbar_cpu_temperature_celsius() -> Double
+
 private enum DefaultsKey {
     static let refreshInterval = "refreshInterval"
     static let showActiveApps = "showActiveApps"
     static let showMenuBarLabel = "showMenuBarLabel"
+    static let compactMenuBar = "compactMenuBar"
     static let showChargingRate = "showChargingRate"
+    static let showNetworkSpeeds = "showNetworkSpeeds"
     static let trackEnergyUsage = "trackEnergyUsage"
     static let accumulatedEnergyWh = "accumulatedEnergyWh"
     static let accumulatedTrackingSeconds = "accumulatedTrackingSeconds"
@@ -40,6 +45,13 @@ private struct ActiveApp {
     let name: String
     let cpu: Double
     let memoryMB: Int
+}
+
+private struct NetworkSpeedReading {
+    let downloadBytesPerSecond: Double
+    let uploadBytesPerSecond: Double
+    let totalDownloadedBytes: UInt64
+    let totalUploadedBytes: UInt64
 }
 
 private struct EnergyAccumulator {
@@ -390,14 +402,113 @@ private final class GPUReader {
     }
 }
 
+private final class CPUTemperatureReader {
+    func read() -> Double? {
+        let celsius = wattbar_cpu_temperature_celsius()
+        return celsius >= 0 ? celsius : nil
+    }
+}
+
+private final class StatusItemHoverHandler: NSObject {
+    private let onEnter: () -> Void
+    private let onExit: () -> Void
+
+    init(onEnter: @escaping () -> Void, onExit: @escaping () -> Void) {
+        self.onEnter = onEnter
+        self.onExit = onExit
+    }
+
+    @objc func mouseEntered(with event: NSEvent) {
+        onEnter()
+    }
+
+    @objc func mouseExited(with event: NSEvent) {
+        onExit()
+    }
+}
+
+private final class NetworkSpeedReader {
+    private var previousSample: (receivedBytes: UInt64, sentBytes: UInt64, date: Date)?
+    private var totalDownloadedBytes: UInt64 = 0
+    private var totalUploadedBytes: UInt64 = 0
+
+    func read(at date: Date = Date()) -> NetworkSpeedReading? {
+        guard let counters = interfaceByteCounters() else {
+            previousSample = nil
+            return nil
+        }
+
+        guard let previousSample else {
+            self.previousSample = (counters.receivedBytes, counters.sentBytes, date)
+            return NetworkSpeedReading(
+                downloadBytesPerSecond: 0,
+                uploadBytesPerSecond: 0,
+                totalDownloadedBytes: 0,
+                totalUploadedBytes: 0
+            )
+        }
+        let elapsed = date.timeIntervalSince(previousSample.date)
+        self.previousSample = (counters.receivedBytes, counters.sentBytes, date)
+        guard elapsed > 0 else {
+            return nil
+        }
+
+        let downloadedBytes = counters.receivedBytes >= previousSample.receivedBytes
+            ? counters.receivedBytes - previousSample.receivedBytes
+            : 0
+        let uploadedBytes = counters.sentBytes >= previousSample.sentBytes
+            ? counters.sentBytes - previousSample.sentBytes
+            : 0
+        totalDownloadedBytes &+= downloadedBytes
+        totalUploadedBytes &+= uploadedBytes
+
+        return NetworkSpeedReading(
+            downloadBytesPerSecond: Double(downloadedBytes) / elapsed,
+            uploadBytesPerSecond: Double(uploadedBytes) / elapsed,
+            totalDownloadedBytes: totalDownloadedBytes,
+            totalUploadedBytes: totalUploadedBytes
+        )
+    }
+
+    private func interfaceByteCounters() -> (receivedBytes: UInt64, sentBytes: UInt64)? {
+        var firstAddress: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&firstAddress) == 0, let firstAddress else { return nil }
+        defer { freeifaddrs(firstAddress) }
+
+        var receivedBytes: UInt64 = 0
+        var sentBytes: UInt64 = 0
+        var foundInterface = false
+        var address: UnsafeMutablePointer<ifaddrs>? = firstAddress
+
+        while let current = address {
+            let interface = current.pointee
+            if let socketAddress = interface.ifa_addr,
+               socketAddress.pointee.sa_family == UInt8(AF_LINK),
+               interface.ifa_flags & UInt32(IFF_UP) != 0,
+               interface.ifa_flags & UInt32(IFF_LOOPBACK) == 0,
+               let rawData = interface.ifa_data {
+                let data = rawData.assumingMemoryBound(to: if_data.self).pointee
+                receivedBytes &+= UInt64(data.ifi_ibytes)
+                sentBytes &+= UInt64(data.ifi_obytes)
+                foundInterface = true
+            }
+            address = interface.ifa_next
+        }
+
+        return foundInterface ? (receivedBytes, sentBytes) : nil
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let reader = SystemPowerReader()
     private let gpuReader = GPUReader()
+    private let cpuTemperatureReader = CPUTemperatureReader()
+    private let networkSpeedReader = NetworkSpeedReader()
     private let activeAppReader = ActiveAppReader()
     private let activeAppRefreshInterval: TimeInterval = 15
     private let energyPersistenceInterval: TimeInterval = 30
     private let statusFont = NSFont.monospacedDigitSystemFont(
-        ofSize: NSFont.systemFontSize,
+        ofSize: 10,
         weight: .regular
     )
     private let formatter: DateFormatter = {
@@ -408,10 +519,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }()
 
     private var statusItem: NSStatusItem?
+    private var statusMenu: NSMenu?
+    private var hoverTrackingHandler: StatusItemHoverHandler?
+    private var hoverPopover: NSPopover?
+    private var localRightClickMonitor: Any?
+    private var globalRightClickMonitor: Any?
+    private var lastRightClickTime: TimeInterval = 0
     private var timer: Timer?
     private var instanceLock: InstanceLock?
     private var latestReading: PowerReading?
     private var latestGPUWatts: Double?
+    private var latestCPUTemperature: Double?
+    private var latestNetworkSpeed: NetworkSpeedReading?
     private var latestActiveApps: [ActiveApp] = []
     private var energyAccumulator = EnergyAccumulator(wattHours: 0, activeSeconds: 0)
     private var lastActiveAppRefresh: Date?
@@ -423,6 +542,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private lazy var statusAttributes: [NSAttributedString.Key: Any] = [.font: statusFont]
     private lazy var cpuStatusIcon = statusIconAttachment(.cpu, font: statusFont)
     private lazy var gpuStatusIcon = statusIconAttachment(.gpu, font: statusFont)
+    private lazy var compactStatusImage: NSImage? = {
+        guard let image = NSImage(
+            systemSymbolName: "bolt.horizontal.circle",
+            accessibilityDescription: "WattBar"
+        ) else { return nil }
+
+        let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
+        let configuredImage = image.withSymbolConfiguration(configuration) ?? image
+        configuredImage.isTemplate = true
+        return configuredImage
+    }()
 
     private var refreshInterval: TimeInterval {
         get {
@@ -452,12 +582,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
     }
 
+    private var compactMenuBar: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: DefaultsKey.compactMenuBar)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.compactMenuBar)
+        }
+    }
+
     private var showChargingRate: Bool {
         get {
             UserDefaults.standard.bool(forKey: DefaultsKey.showChargingRate)
         }
         set {
             UserDefaults.standard.set(newValue, forKey: DefaultsKey.showChargingRate)
+        }
+    }
+
+    private var showNetworkSpeeds: Bool {
+        get {
+            UserDefaults.standard.bool(forKey: DefaultsKey.showNetworkSpeeds)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: DefaultsKey.showNetworkSpeeds)
         }
     }
 
@@ -522,12 +670,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         energyUsageLoaded = true
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem?.button?.toolTip = "WattBar"
+        statusItem?.button?.target = self
+        statusItem?.button?.action = #selector(handleStatusItemClick)
+        statusItem?.button?.sendAction(on: [.leftMouseUp])
+        installHoverTracking()
+        installRightClickHandling()
 
         refresh()
         scheduleTimer()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let localRightClickMonitor {
+            NSEvent.removeMonitor(localRightClickMonitor)
+        }
+        if let globalRightClickMonitor {
+            NSEvent.removeMonitor(globalRightClickMonitor)
+        }
         persistEnergyUsage(force: true)
     }
 
@@ -538,11 +697,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateEnergyUsage(with: reading)
         latestReading = reading
         latestGPUWatts = gpuReader.read()
+        latestCPUTemperature = cpuTemperatureReader.read()
+        latestNetworkSpeed = networkSpeedReader.read(at: reading.updatedAt)
         if menuIsOpen {
             refreshActiveAppsIfNeeded(minimumAge: activeAppRefreshInterval)
         }
         rebuildMenu()
         updateStatusTitle()
+        updateHoverPopover()
     }
 
     @objc private func quit() {
@@ -572,8 +734,146 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         updateStatusTitle()
     }
 
+    @objc private func handleStatusItemClick() {
+        hideHoverPopover()
+        compactMenuBar.toggle()
+        rebuildMenu(force: true)
+        updateStatusTitle()
+    }
+
+    @objc private func toggleCompactMenuBar() {
+        compactMenuBar.toggle()
+        rebuildMenu()
+        updateStatusTitle()
+    }
+
+    private func installHoverTracking() {
+        guard let button = statusItem?.button else { return }
+
+        let handler = StatusItemHoverHandler(
+            onEnter: { [weak self] in self?.showHoverPopover() },
+            onExit: { [weak self] in self?.hideHoverPopover() }
+        )
+        let trackingArea = NSTrackingArea(
+            rect: button.bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: handler,
+            userInfo: nil
+        )
+        button.addTrackingArea(trackingArea)
+        hoverTrackingHandler = handler
+    }
+
+    private func installRightClickHandling() {
+        localRightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleRightClickIfNeeded() ? nil : event
+        }
+        globalRightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .rightMouseDown) { [weak self] _ in
+            _ = self?.handleRightClickIfNeeded()
+        }
+    }
+
+    @discardableResult
+    private func handleRightClickIfNeeded() -> Bool {
+        guard let button = statusItem?.button,
+              let window = button.window else { return false }
+
+        let buttonFrameInWindow = button.convert(button.bounds, to: nil)
+        let buttonFrameOnScreen = window.convertToScreen(buttonFrameInWindow)
+        guard buttonFrameOnScreen.contains(NSEvent.mouseLocation) else { return false }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastRightClickTime > 0.2 else { return true }
+        lastRightClickTime = now
+
+        showStatusMenu()
+        return true
+    }
+
+    private func showStatusMenu() {
+        guard let menu = statusMenu, let button = statusItem?.button else { return }
+        hideHoverPopover()
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: button.bounds.midX, y: button.bounds.minY),
+            in: button
+        )
+    }
+
+    private func showHoverPopover() {
+        guard compactMenuBar, let button = statusItem?.button else { return }
+
+        let popover = hoverPopover ?? NSPopover()
+        popover.behavior = .transient
+        popover.animates = false
+        popover.contentViewController = hoverDetailViewController()
+        hoverPopover = popover
+
+        if !popover.isShown {
+            popover.show(
+                relativeTo: button.bounds,
+                of: button,
+                preferredEdge: .maxY
+            )
+        }
+    }
+
+    private func hideHoverPopover() {
+        hoverPopover?.performClose(nil)
+    }
+
+    private func updateHoverPopover() {
+        guard hoverPopover?.isShown == true else { return }
+        hoverPopover?.contentViewController = hoverDetailViewController()
+    }
+
+    private func hoverDetailViewController() -> NSViewController {
+        let text = NSTextField(wrappingLabelWithString: hoverDetailsText())
+        text.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.textColor = .labelColor
+        text.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 330, height: 190))
+        container.addSubview(text)
+        NSLayoutConstraint.activate([
+            text.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            text.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            text.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+            text.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14)
+        ])
+
+        let controller = NSViewController()
+        controller.view = container
+        controller.preferredContentSize = NSSize(width: 330, height: 190)
+        return controller
+    }
+
+    private func hoverDetailsText() -> String {
+        guard let reading = latestReading else { return "WattBar is measuring…" }
+
+        return """
+        System draw: \(formatWatts(reading.systemWatts))
+        CPU temperature: \(formatCPUTemperature(latestCPUTemperature))
+        Adapter input: \(formatWatts(reading.adapterInputWatts))
+        GPU draw: \(formatGPUWatts(latestGPUWatts))
+        Power: \(reading.powerState)
+        Battery flow: \(formatBatteryFlow(reading.batteryFlowWatts))
+        Download: \(formatNetworkSpeed(latestNetworkSpeed?.downloadBytesPerSecond))
+        Upload: \(formatNetworkSpeed(latestNetworkSpeed?.uploadBytesPerSecond))
+        Total downloaded: \(formatByteCount(latestNetworkSpeed?.totalDownloadedBytes))
+        Total uploaded: \(formatByteCount(latestNetworkSpeed?.totalUploadedBytes))
+        """
+    }
+
     @objc private func toggleChargingRate() {
         showChargingRate.toggle()
+        rebuildMenu()
+        updateStatusTitle()
+    }
+
+    @objc private func toggleNetworkSpeeds() {
+        showNetworkSpeeds.toggle()
         rebuildMenu()
         updateStatusTitle()
     }
@@ -727,25 +1027,42 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func updateStatusTitle() {
         guard let reading = latestReading else {
-            statusItem?.button?.title = "WattBar"
+            applyStatusPresentation(
+                length: compactMenuBar ? 28 : NSStatusItem.variableLength,
+                image: compactMenuBar ? compactStatusImage : nil,
+                title: compactMenuBar ? "" : "WattBar",
+                attributedTitle: NSAttributedString(string: ""),
+                accessibilityLabel: "WattBar",
+                toolTip: "WattBar is measuring..."
+            )
             return
         }
 
         let wattsValue = reading.systemWatts.map { String(format: "%.1f W", $0) } ?? "-- W"
         let gpuValue = latestGPUWatts.map { String(format: "%.1f W", $0) } ?? "-- W"
+        let cpuTemperatureValue = formatCPUTemperature(latestCPUTemperature, unavailable: "-- °C")
+        let compactWattsValue = reading.systemWatts.map { String(format: "%.0fW", $0) } ?? "--W"
+        let compactGPUValue = latestGPUWatts.map { String(format: "%.0fW", $0) } ?? "--W"
+        let compactCPUTemperatureValue = latestCPUTemperature.map { String(format: "%.0f°", $0) } ?? "--°"
         let powerFlowText = showChargingRate
-            ? formatMenuBarPowerFlow(
+            ? formatCompactMenuBarPowerFlow(
                 adapterInputWatts: reading.adapterInputWatts,
                 batteryFlowWatts: reading.batteryFlowWatts
             )
             : nil
         let gpuTooltip = latestGPUWatts.map { String(format: "%.1f W", $0) } ?? "unavailable"
         let batteryTooltip = formatBatteryFlow(reading.batteryFlowWatts)
+        let compactNetworkValue = showNetworkSpeeds
+            ? formatCompactNetworkSpeed(latestNetworkSpeed)
+            : nil
         let signature = [
             showMenuBarLabel ? "label" : "no-label",
-            wattsValue,
-            gpuValue,
+            compactMenuBar ? "compact" : "expanded",
+            compactWattsValue,
+            compactCPUTemperatureValue,
+            compactGPUValue,
             powerFlowText ?? "no-flow",
+            compactNetworkValue ?? "no-network",
             batteryTooltip
         ].joined(separator: "|")
         guard signature != lastStatusSignature else { return }
@@ -759,7 +1076,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             attributedTitle.append(NSAttributedString(string: "WattBar ", attributes: attributes))
         }
         attributedTitle.append(cpuStatusIcon)
-        attributedTitle.append(NSAttributedString(string: " \(wattsValue)", attributes: attributes))
+        attributedTitle.append(
+            NSAttributedString(
+                string: " \(compactWattsValue) \(compactCPUTemperatureValue)",
+                attributes: attributes
+            )
+        )
 
         if let powerFlowText {
             attributedTitle.append(NSAttributedString(string: " | ", attributes: attributes))
@@ -774,22 +1096,75 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         attributedTitle.append(NSAttributedString(string: " | ", attributes: attributes))
         attributedTitle.append(gpuStatusIcon)
-        attributedTitle.append(NSAttributedString(string: " \(gpuValue)", attributes: attributes))
+        attributedTitle.append(NSAttributedString(string: " \(compactGPUValue)", attributes: attributes))
 
-        let accessibleParts = ["System \(wattsValue)", powerFlowText, "GPU \(gpuValue)"].compactMap { $0 }
+        if let compactNetworkValue {
+            attributedTitle.append(NSAttributedString(string: " | \(compactNetworkValue)", attributes: attributes))
+        }
+
+        let accessibleParts = [
+            "System \(wattsValue)",
+            "CPU temperature \(cpuTemperatureValue)",
+            (showChargingRate || compactMenuBar) ? formatMenuBarPowerFlow(
+                adapterInputWatts: reading.adapterInputWatts,
+                batteryFlowWatts: reading.batteryFlowWatts
+            ) : nil,
+            (showNetworkSpeeds || compactMenuBar) ? formatAccessibleNetworkSpeed(latestNetworkSpeed) : nil,
+            "GPU \(gpuValue)"
+        ].compactMap { $0 }
         let accessibleTitle = accessibleParts.joined(separator: " | ")
-        let width = ceil(attributedTitle.size().width) + 18
+        let width = ceil(attributedTitle.size().width) + 12
 
-        statusItem?.length = max(46, width)
         statusItem?.button?.font = font
-        statusItem?.button?.image = nil
-        statusItem?.button?.title = accessibleTitle
-        statusItem?.button?.attributedTitle = attributedTitle
-        statusItem?.button?.setAccessibilityLabel("WattBar \(accessibleTitle)")
-        statusItem?.button?.toolTip = "System draw: \(wattsValue) | Battery: \(batteryTooltip) | GPU: \(gpuTooltip)"
+        let networkTooltip = (showNetworkSpeeds || compactMenuBar)
+            ? " | \(formatAccessibleNetworkSpeed(latestNetworkSpeed)) | Total downloaded \(formatByteCount(latestNetworkSpeed?.totalDownloadedBytes)) | Total uploaded \(formatByteCount(latestNetworkSpeed?.totalUploadedBytes))"
+            : ""
+        let chargingTooltip = (showChargingRate || compactMenuBar)
+            ? " | \(formatMenuBarPowerFlow(adapterInputWatts: reading.adapterInputWatts, batteryFlowWatts: reading.batteryFlowWatts))"
+            : ""
+        applyStatusPresentation(
+            length: compactMenuBar ? 28 : max(40, width),
+            image: compactMenuBar ? compactStatusImage : nil,
+            title: compactMenuBar ? "" : accessibleTitle,
+            attributedTitle: compactMenuBar
+                ? NSAttributedString(string: "")
+                : attributedTitle,
+            accessibilityLabel: "WattBar \(accessibleTitle)",
+            toolTip: "System draw: \(wattsValue) | CPU temperature: \(cpuTemperatureValue) | Battery: \(batteryTooltip) | GPU: \(gpuTooltip)\(chargingTooltip)\(networkTooltip)"
+        )
+    }
+
+    private func applyStatusPresentation(
+        length: CGFloat,
+        image: NSImage?,
+        title: String,
+        attributedTitle: NSAttributedString,
+        accessibilityLabel: String,
+        toolTip: String
+    ) {
+        guard let statusItem, let button = statusItem.button else { return }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+
+            // Replace the contents before resizing the status item so AppKit
+            // never renders the compact icon over the expanded text.
+            button.image = image
+            button.imagePosition = image == nil ? .noImage : .imageOnly
+            button.imageScaling = .scaleNone
+            button.title = title
+            button.attributedTitle = attributedTitle
+            button.setAccessibilityLabel(accessibilityLabel)
+            button.toolTip = toolTip
+            statusItem.length = length
+            button.needsLayout = true
+            button.layoutSubtreeIfNeeded()
+        }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        hideHoverPopover()
         menuIsOpen = true
         refreshActiveAppsIfNeeded(minimumAge: 5)
         rebuildMenu(force: true)
@@ -801,58 +1176,149 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
     private func rebuildMenu(force: Bool = false) {
         let menu: NSMenu
-        if let existingMenu = statusItem?.menu {
+        if let existingMenu = statusMenu {
             menu = existingMenu
         } else {
             menu = NSMenu(title: "WattBar")
             menu.delegate = self
-            statusItem?.menu = menu
+            statusMenu = menu
         }
 
         guard force || menuIsOpen || !menuHasBeenBuilt else { return }
         menu.removeAllItems()
 
+        let compactMenuItem = NSMenuItem(
+            title: compactMenuBar ? "Show Full Display" : "Minimize WattBar",
+            action: #selector(toggleCompactMenuBar),
+            keyEquivalent: ""
+        )
+        compactMenuItem.target = self
+        compactMenuItem.state = compactMenuBar ? .on : .off
+        menu.addItem(compactMenuItem)
+        menu.addItem(.separator())
+
+        addSectionHeader("Live readings", to: menu)
         if let reading = latestReading {
-            addInfo("System draw: \(formatWatts(reading.systemWatts))", to: menu)
-            addInfo("Adapter input: \(formatWatts(reading.adapterInputWatts))", to: menu)
-            addInfo("GPU draw: \(formatGPUWatts(latestGPUWatts))", to: menu)
-            addInfo("Power: \(reading.powerState)", to: menu)
-            addInfo("Battery flow: \(formatBatteryFlow(reading.batteryFlowWatts))", to: menu)
-            addInfo("Whole-device source: \(reading.source)", to: menu)
-            addInfo("Details: \(reading.details)", to: menu)
-            addInfo("Updated: \(formatter.string(from: reading.updatedAt))", to: menu)
+            addInfo("System draw   \(formatWatts(reading.systemWatts))", to: menu)
+            addInfo("CPU temperature   \(formatCPUTemperature(latestCPUTemperature))", to: menu)
+            addInfo("Adapter input   \(formatWatts(reading.adapterInputWatts))", to: menu)
+            addInfo("GPU draw   \(formatGPUWatts(latestGPUWatts))", to: menu)
+            addInfo("Power   \(reading.powerState)", to: menu)
+            addInfo("Battery flow   \(formatBatteryFlow(reading.batteryFlowWatts))", to: menu)
+
+            let detailsItem = NSMenuItem(title: "Reading details", action: nil, keyEquivalent: "")
+            let detailsMenu = NSMenu(title: "Reading details")
+            addInfo("Whole-device source   \(reading.source)", to: detailsMenu)
+            addInfo("Details   \(reading.details)", to: detailsMenu)
+            addInfo("Updated   \(formatter.string(from: reading.updatedAt))", to: detailsMenu)
+            detailsItem.submenu = detailsMenu
+            menu.addItem(detailsItem)
         } else {
-            addInfo("WattBar is measuring...", to: menu)
+            addInfo("WattBar is measuring…", to: menu)
         }
 
         menu.addItem(.separator())
-        addEnergySection(to: menu)
+
+        let energyItem = NSMenuItem(title: "Energy & Cost", action: nil, keyEquivalent: "")
+        let energyMenu = NSMenu(title: "Energy & Cost")
+        addEnergySection(to: energyMenu)
+        energyItem.submenu = energyMenu
+        menu.addItem(energyItem)
+
+        let networkItem = NSMenuItem(title: "Network Speeds & Totals", action: nil, keyEquivalent: "")
+        networkItem.submenu = networkUsageMenu()
+        menu.addItem(networkItem)
+
+        let activeAppsItem = NSMenuItem(title: "Active Apps", action: nil, keyEquivalent: "")
+        activeAppsItem.submenu = activeAppsMenu()
+        menu.addItem(activeAppsItem)
+
+        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        settingsItem.submenu = settingsMenu()
+        menu.addItem(settingsItem)
 
         menu.addItem(.separator())
-        addInfo("Top active apps (CPU, not exact watts)", to: menu)
+
+        let quitItem = NSMenuItem(title: "Quit WattBar", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        menuHasBeenBuilt = true
+    }
+
+    private func addSectionHeader(_ title: String, to menu: NSMenu) {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        menu.addItem(item)
+    }
+
+    private func networkUsageMenu() -> NSMenu {
+        let menu = NSMenu(title: "Network Speeds & Totals")
+
+        let networkSpeedsItem = NSMenuItem(
+            title: "Show Speeds in Menu Bar",
+            action: #selector(toggleNetworkSpeeds),
+            keyEquivalent: ""
+        )
+        networkSpeedsItem.target = self
+        networkSpeedsItem.state = showNetworkSpeeds ? .on : .off
+        menu.addItem(networkSpeedsItem)
+        menu.addItem(.separator())
+        addInfo("Current download   \(formatNetworkSpeed(latestNetworkSpeed?.downloadBytesPerSecond))", to: menu)
+        addInfo("Current upload   \(formatNetworkSpeed(latestNetworkSpeed?.uploadBytesPerSecond))", to: menu)
+        addInfo("Total downloaded   \(formatByteCount(latestNetworkSpeed?.totalDownloadedBytes))", to: menu)
+        addInfo("Total uploaded   \(formatByteCount(latestNetworkSpeed?.totalUploadedBytes))", to: menu)
+        return menu
+    }
+
+    private func activeAppsMenu() -> NSMenu {
+        let menu = NSMenu(title: "Active Apps")
+
+        let activeAppsToggle = NSMenuItem(
+            title: showActiveApps ? "Hide Active Apps" : "Show Active Apps",
+            action: #selector(toggleActiveApps),
+            keyEquivalent: ""
+        )
+        activeAppsToggle.target = self
+        activeAppsToggle.state = showActiveApps ? .on : .off
+        menu.addItem(activeAppsToggle)
+        menu.addItem(.separator())
 
         if showActiveApps {
             if latestActiveApps.isEmpty {
                 addInfo("No busy apps right now", to: menu)
             } else {
                 for (index, app) in latestActiveApps.enumerated() {
-                    addInfo("\(index + 1). \(app.name) - \(String(format: "%.1f", app.cpu))% CPU, \(app.memoryMB) MB RAM", to: menu)
+                    addInfo(
+                        "\(index + 1). \(app.name)   \(String(format: "%.1f", app.cpu))% CPU · \(app.memoryMB) MB RAM",
+                        to: menu
+                    )
                 }
             }
         } else {
-            addInfo("Hidden", to: menu)
+            addInfo("Active-app readings are hidden", to: menu)
         }
+        return menu
+    }
 
-        menu.addItem(.separator())
+    private func settingsMenu() -> NSMenu {
+        let menu = NSMenu(title: "Settings")
 
-        let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refresh), keyEquivalent: "r")
+        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
         let intervalItem = NSMenuItem(title: "Refresh Interval", action: nil, keyEquivalent: "")
         let intervalMenu = NSMenu(title: "Refresh Interval")
         for interval in [2.0, 5.0, 10.0, 30.0] {
-            let item = NSMenuItem(title: "\(Int(interval)) seconds", action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: "Every \(Int(interval)) seconds", action: #selector(setRefreshInterval(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = interval
             item.state = abs(refreshInterval - interval) < 0.1 ? .on : .off
@@ -860,11 +1326,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         }
         intervalItem.submenu = intervalMenu
         menu.addItem(intervalItem)
-
-        let activeAppsItem = NSMenuItem(title: "Show Active Apps", action: #selector(toggleActiveApps), keyEquivalent: "")
-        activeAppsItem.target = self
-        activeAppsItem.state = showActiveApps ? .on : .off
-        menu.addItem(activeAppsItem)
+        menu.addItem(.separator())
 
         let menuLabelItem = NSMenuItem(title: "Show WattBar Label", action: #selector(toggleMenuBarLabel), keyEquivalent: "")
         menuLabelItem.target = self
@@ -888,14 +1350,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             openAtLoginItem.isEnabled = false
         }
         menu.addItem(openAtLoginItem)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit WattBar", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
-        menuHasBeenBuilt = true
+        return menu
     }
 
     private func addInfo(_ title: String, to menu: NSMenu) {
@@ -1145,14 +1600,63 @@ private func formatMenuBarPowerFlow(adapterInputWatts: Double?, batteryFlowWatts
     return "Power idle"
 }
 
+private func formatCompactMenuBarPowerFlow(adapterInputWatts: Double?, batteryFlowWatts: Double?) -> String {
+    if let adapterInputWatts, adapterInputWatts > 0.05 {
+        return String(format: "⚡︎%.0fW", adapterInputWatts)
+    }
+
+    if let batteryFlowWatts, batteryFlowWatts < -0.05 {
+        return String(format: "−%.0fW", abs(batteryFlowWatts))
+    }
+
+    return "Idle"
+}
+
+private func formatNetworkSpeed(_ bytesPerSecond: Double?) -> String {
+    guard let bytesPerSecond, bytesPerSecond.isFinite, bytesPerSecond >= 0 else {
+        return "measuring…"
+    }
+
+    if bytesPerSecond >= 1_000_000_000 {
+        return String(format: "%.1f GB/s", bytesPerSecond / 1_000_000_000)
+    }
+    if bytesPerSecond >= 1_000_000 {
+        return String(format: "%.1f MB/s", bytesPerSecond / 1_000_000)
+    }
+    if bytesPerSecond >= 1_000 {
+        return String(format: "%.0f KB/s", bytesPerSecond / 1_000)
+    }
+    return String(format: "%.0f B/s", bytesPerSecond)
+}
+
+private func formatCompactNetworkSpeed(_ reading: NetworkSpeedReading?) -> String {
+    guard let reading else { return "↓-- ↑--" }
+    return "↓\(formatNetworkSpeed(reading.downloadBytesPerSecond)) ↑\(formatNetworkSpeed(reading.uploadBytesPerSecond))"
+}
+
+private func formatAccessibleNetworkSpeed(_ reading: NetworkSpeedReading?) -> String {
+    guard let reading else { return "Network speed measuring" }
+    return "Download \(formatNetworkSpeed(reading.downloadBytesPerSecond)), upload \(formatNetworkSpeed(reading.uploadBytesPerSecond))"
+}
+
+private func formatByteCount(_ bytes: UInt64?) -> String {
+    guard let bytes else { return "measuring…" }
+    return ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .decimal)
+}
+
 private enum StatusPowerIcon {
     case cpu
     case gpu
 }
 
 private func statusIconAttachment(_ icon: StatusPowerIcon, font: NSFont) -> NSAttributedString {
-    let size = icon == .cpu ? NSSize(width: 15, height: 15) : NSSize(width: 18, height: 14)
-    let image = NSImage(size: size, flipped: false) { rect in
+    let baseSize = icon == .cpu ? NSSize(width: 15, height: 15) : NSSize(width: 18, height: 14)
+    let scale = font.pointSize / NSFont.systemFontSize
+    let displaySize = NSSize(
+        width: round(baseSize.width * scale),
+        height: round(baseSize.height * scale)
+    )
+    let image = NSImage(size: baseSize, flipped: false) { rect in
         NSColor.labelColor.setStroke()
         switch icon {
         case .cpu:
@@ -1169,8 +1673,8 @@ private func statusIconAttachment(_ icon: StatusPowerIcon, font: NSFont) -> NSAt
     attachment.bounds = NSRect(
         x: 0,
         y: floor(font.descender) + 1,
-        width: size.width,
-        height: size.height
+        width: displaySize.width,
+        height: displaySize.height
     )
     return NSAttributedString(attachment: attachment)
 }
@@ -1216,6 +1720,11 @@ private func drawGPUStatusIcon(in rect: NSRect) {
 private func formatGPUWatts(_ watts: Double?) -> String {
     guard let watts else { return "unavailable" }
     return String(format: "%.1f W (estimated)", watts)
+}
+
+private func formatCPUTemperature(_ celsius: Double?, unavailable: String = "unavailable") -> String {
+    guard let celsius else { return unavailable }
+    return String(format: "%.0f °C", celsius)
 }
 
 let app = NSApplication.shared

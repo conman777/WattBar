@@ -8,6 +8,8 @@ MACOS="$CONTENTS/MacOS"
 SOURCE="$ROOT/Sources/WattBar/main.swift"
 GPU_SOURCE="$ROOT/Tools/IOReportPower.c"
 GPU_OBJECT="$ROOT/Tools/bin/IOReportPower.o"
+CPU_TEMPERATURE_SOURCE="$ROOT/Tools/CPUTemperature.c"
+CPU_TEMPERATURE_OBJECT="$ROOT/Tools/bin/CPUTemperature.o"
 PLIST="$ROOT/Sources/WattBar/Info.plist"
 # Ad-hoc signing keeps local builds reproducible without embedding a developer's
 # personal signing identity. Set SIGN_IDENTITY explicitly for a trusted build.
@@ -23,12 +25,19 @@ clang \
   -c "$GPU_SOURCE" \
   -o "$GPU_OBJECT"
 
+clang \
+  -O2 \
+  -target arm64-apple-macos13.0 \
+  -c "$CPU_TEMPERATURE_SOURCE" \
+  -o "$CPU_TEMPERATURE_OBJECT"
+
 xcrun swiftc \
   -swift-version 5 \
   -O \
   -target arm64-apple-macos13.0 \
   "$SOURCE" \
   "$GPU_OBJECT" \
+  "$CPU_TEMPERATURE_OBJECT" \
   -framework Cocoa \
   -framework IOKit \
   -framework ServiceManagement \
