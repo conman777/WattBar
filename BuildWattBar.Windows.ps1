@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $source = Join-Path $root "Sources\WattBar.Windows\WattBar.Windows.cs"
+$dashboardSource = Join-Path $root "Sources\WattBar.Windows\DashboardForm.cs"
 $output = Join-Path $root "WattBar.Windows.exe"
 
 $compilerCandidates = @(
@@ -27,7 +28,8 @@ if (-not $compiler) {
     /reference:System.Runtime.Serialization.dll `
     /reference:System.Windows.Forms.dll `
     "/out:$output" `
-    $source
+    $source `
+    $dashboardSource
 
 if ($LASTEXITCODE -ne 0) {
     throw "Watt Bar Windows build failed with exit code $LASTEXITCODE."

@@ -1040,6 +1040,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
 
         let wattsValue = reading.systemWatts.map { String(format: "%.1f W", $0) } ?? "-- W"
         let gpuValue = latestGPUWatts.map { String(format: "%.1f W", $0) } ?? "-- W"
+        let uptimeValue = formatSystemUptime(ProcessInfo.processInfo.systemUptime)
         let cpuTemperatureValue = formatCPUTemperature(latestCPUTemperature, unavailable: "-- °C")
         let compactWattsValue = reading.systemWatts.map { String(format: "%.0fW", $0) } ?? "--W"
         let compactGPUValue = latestGPUWatts.map { String(format: "%.0fW", $0) } ?? "--W"
@@ -1061,6 +1062,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
             compactWattsValue,
             compactCPUTemperatureValue,
             compactGPUValue,
+            uptimeValue,
             powerFlowText ?? "no-flow",
             compactNetworkValue ?? "no-network",
             batteryTooltip
@@ -1110,7 +1112,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 batteryFlowWatts: reading.batteryFlowWatts
             ) : nil,
             (showNetworkSpeeds || compactMenuBar) ? formatAccessibleNetworkSpeed(latestNetworkSpeed) : nil,
-            "GPU \(gpuValue)"
+            "GPU \(gpuValue)",
+            "Computer uptime \(uptimeValue)"
         ].compactMap { $0 }
         let accessibleTitle = accessibleParts.joined(separator: " | ")
         let width = ceil(attributedTitle.size().width) + 12
@@ -1130,7 +1133,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
                 ? NSAttributedString(string: "")
                 : attributedTitle,
             accessibilityLabel: "WattBar \(accessibleTitle)",
-            toolTip: "System draw: \(wattsValue) | CPU temperature: \(cpuTemperatureValue) | Battery: \(batteryTooltip) | GPU: \(gpuTooltip)\(chargingTooltip)\(networkTooltip)"
+            toolTip: "System draw: \(wattsValue) | CPU temperature: \(cpuTemperatureValue) | Battery: \(batteryTooltip) | GPU: \(gpuTooltip) | Computer uptime: \(uptimeValue)\(chargingTooltip)\(networkTooltip)"
         )
     }
 
@@ -1216,6 +1219,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         } else {
             addInfo("WattBar is measuring…", to: menu)
         }
+
+        addInfo(
+            "Computer uptime: \(formatSystemUptime(ProcessInfo.processInfo.systemUptime))",
+            to: menu
+        )
 
         menu.addItem(.separator())
 
@@ -1564,6 +1572,10 @@ private func formatTrackingDuration(_ seconds: TimeInterval) -> String {
         return "\(minutes)m \(remainingSeconds)s"
     }
     return "\(remainingSeconds)s"
+}
+
+private func formatSystemUptime(_ seconds: TimeInterval) -> String {
+    formatTrackingDuration(seconds)
 }
 
 private func formatRand(_ rand: Double) -> String {
