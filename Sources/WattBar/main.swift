@@ -525,6 +525,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var localRightClickMonitor: Any?
     private var globalRightClickMonitor: Any?
     private var lastRightClickTime: TimeInterval = 0
+    private var statusMenuPresentationPending = false
     private var timer: Timer?
     private var instanceLock: InstanceLock?
     private var latestReading: PowerReading?
@@ -765,11 +766,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     private func installRightClickHandling() {
-        localRightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+        localRightClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseUp) { [weak self] event in
             guard let self else { return event }
             return self.handleRightClickIfNeeded() ? nil : event
         }
-        globalRightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .rightMouseDown) { [weak self] _ in
+        globalRightClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .rightMouseUp) { [weak self] _ in
             _ = self?.handleRightClickIfNeeded()
         }
     }
@@ -787,11 +788,25 @@ private final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         guard now - lastRightClickTime > 0.2 else { return true }
         lastRightClickTime = now
 
-        showStatusMenu()
+        presentStatusMenu()
         return true
     }
 
+    private func presentStatusMenu() {
+        guard !statusMenuPresentationPending else { return }
+        statusMenuPresentationPending = true
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.statusMenuPresentationPending = false
+            self.showStatusMenu()
+        }
+    }
+
     private func showStatusMenu() {
+        if statusMenu == nil {
+            rebuildMenu(force: true)
+        }
         guard let menu = statusMenu, let button = statusItem?.button else { return }
         hideHoverPopover()
         menu.popUp(
