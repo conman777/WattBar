@@ -15,7 +15,9 @@ The macOS version displays:
 - CPU temperature, with a chart of the last hour in the menu (kept in memory, so it restarts with the app)
 - Optional live download and upload speeds in the menu bar, with session totals in the menu
 - Fan speed in the menu, shown as off when the fan has stopped and hidden on fanless Macs
-- Optional icon-only mode; left-click switches between the icon and the full readout, and right-click (or Control-click) opens the menu
+- Left-click, right-click or Control-click opens the live panel; Show Icon Only remains in Menu Bar Display
+- Click CPU to graph usage, then click again for temperature; Memory, GPU, System draw, Network and battery power flow select their matching graphs without closing the panel
+- The selected reading has an accent outline, and a small metric glyph identifies the menu bar graph
 - Optional accumulated energy, tracking time, and electricity costs
 - The most active applications by CPU and memory usage
 

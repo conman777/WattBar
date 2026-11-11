@@ -50,21 +50,26 @@ final class StatusMenuBuilder {
         self.actions = actions
     }
 
-    func populate(_ menu: NSMenu) {
+    @discardableResult
+    func populate(_ menu: NSMenu) -> LiveMenuPanel {
         menu.removeAllItems()
 
         // Informational rows are view-backed items of one width; their titles
         // keep each section identifiable to tests and assistive technology.
         let updated = snapshot.reading.map { formatter.string(from: $0.updatedAt) }
-        addPanel(DashboardView(snapshot: snapshot, updated: updated, now: Date()),
+        let dashboard = DashboardView(snapshot: snapshot, updated: updated, now: Date())
+        addPanel(dashboard,
                  title: updated.map { "Readings · \($0)" } ?? "Readings", to: menu)
 
         menu.addItem(.separator())
-        addPanel(networkRow(), title: "Network", to: menu)
+        let network = networkRow()
+        addPanel(network, title: "Network", to: menu)
+        var energy: SummaryRowView?
 
         if settings.trackEnergyUsage {
             menu.addItem(.separator())
-            addPanel(energyRow(), title: "Energy & Cost", to: menu)
+            energy = energyRow()
+            addPanel(energy!, title: "Energy & Cost", to: menu)
         }
 
         if settings.showActiveApps {
@@ -104,11 +109,13 @@ final class StatusMenuBuilder {
         let quitItem = NSMenuItem(title: "Quit WattBar", action: #selector(WattBarActions.quit), keyEquivalent: "q")
         quitItem.target = actions
         menu.addItem(quitItem)
+        return LiveMenuPanel(menu: menu, dashboard: dashboard, network: network, energy: energy,
+                             settings: settings, actions: actions, snapshot: snapshot)
     }
 
     private func addPanel(_ view: NSView, title: String, to menu: NSMenu) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
+        item.isEnabled = true
         item.view = view
         menu.addItem(item)
     }
@@ -306,4 +313,106 @@ final class StatusMenuBuilder {
         return menu
     }
 
+}
+
+/// Owns only the views created on open; refreshes never mutate menu structure.
+final class LiveMenuPanel {
+    private weak var menu: NSMenu?
+    let dashboard: DashboardView
+    let network: SummaryRowView
+    private let energy: SummaryRowView?
+    private let settings: AppSettings
+    private weak var actions: (any WattBarActions)?
+    private var hasBattery: Bool
+    private var hoverTimer: Timer?
+    private let formatter: DateFormatter = {
+        let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"; return formatter
+    }()
+
+    init(
+        menu: NSMenu, dashboard: DashboardView, network: SummaryRowView, energy: SummaryRowView?,
+        settings: AppSettings, actions: (any WattBarActions)?, snapshot: MenuSnapshot
+    ) {
+        self.menu = menu; self.dashboard = dashboard; self.network = network; self.energy = energy
+        self.settings = settings; self.actions = actions; hasBattery = hasSystemBattery(snapshot.reading)
+        dashboard.onSelectMetric = { [weak self] in self?.choose($0) }
+        network.onPress = { [weak self] in self?.choose(.networkDownload) }
+        network.actionLabel = "Graph Network download in the menu bar"
+        syncSelection()
+    }
+
+    deinit { hoverTimer?.invalidate() }
+
+    func startTracking() {
+        hoverTimer?.invalidate()
+        // Menu tracking does not reliably deliver tracking-area enter/exit events.
+        // One common-mode timer supplies hover without intercepting menu events.
+        let timer = Timer(timeInterval: 1 / 30, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            for view in [
+                self.dashboard.heroBlock, self.dashboard.flowBlock, self.dashboard.cpu,
+                self.dashboard.memory, self.dashboard.gpu, self.network,
+            ] {
+                guard let window = view.window else { view.updateHover(false); continue }
+                let point = view.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+                view.updateHover(view.onPress != nil && window.isVisible && view.bounds.contains(point))
+            }
+        }
+        hoverTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func choose(_ metric: GraphMetric) {
+        guard metric != .batteryFlow || hasBattery else { return }
+        settings.graphMetric = metric
+        let sender = NSMenuItem(); sender.representedObject = metric.rawValue
+        actions?.setGraphMetric(sender)
+        syncSelection()
+    }
+
+    func syncSelection() {
+        let metric = settings.graphMetric.resolved(hasBattery: hasBattery)
+        dashboard.select(metric); network.graphSelected = metric == .networkDownload
+        func sync(_ menu: NSMenu) {
+            for item in menu.items {
+                if item.action == #selector(WattBarActions.setGraphMetric(_:)),
+                    let raw = item.representedObject as? String
+                {
+                    item.state = raw == metric.rawValue ? .on : .off
+                }
+                if let submenu = item.submenu { sync(submenu) }
+            }
+        }
+        if let menu { sync(menu) }
+    }
+
+    func update(_ snapshot: MenuSnapshot, now: Date = Date()) {
+        hasBattery = hasSystemBattery(snapshot.reading)
+        let updated = snapshot.reading.map { formatter.string(from: $0.updatedAt) }
+        dashboard.update(snapshot: snapshot, updated: updated, now: now)
+        if let speed = snapshot.network {
+            network.update(
+                title: "Network",
+                value:
+                    "↓ \(formatNetworkSpeed(speed.downloadBytesPerSecond))  ↑ \(formatNetworkSpeed(speed.uploadBytesPerSecond))",
+                detailTitle: "Since launch",
+                detailValue:
+                    "↓ \(formatByteCount(speed.totalDownloadedBytes))  ↑ \(formatByteCount(speed.totalUploadedBytes))")
+        } else {
+            network.update(title: "Network", value: "Measuring…", detailTitle: "Since launch", detailValue: "--")
+        }
+        let kWh = snapshot.energy.wattHours / 1_000
+        energy?.update(
+            title: "Energy",
+            value: [
+                formatShortEnergy(snapshot.energy.wattHours), formatRand(kWh * settings.southAfricaTariff),
+                formatPounds(kWh * settings.unitedKingdomTariff),
+            ].joined(separator: " · "), detailTitle: "Tracked for",
+            detailValue: formatTrackingDuration(snapshot.energy.activeSeconds))
+        if let menu {
+            StatusMenuBuilder.updateActiveApps(in: menu, apps: snapshot.activeApps)
+            menu.items.first?.title = updated.map { "Readings · \($0)" } ?? "Readings"
+        }
+        syncSelection()
+    }
 }

@@ -6,6 +6,9 @@ import Cocoa
 final class TemperatureHistoryView: NSView {
     static let chartHeight: CGFloat = 64
 
+    private var summary: NSTextField!
+    private var chart: TemperatureChartView!
+
     init(history: TemperatureHistory, now: Date) {
         super.init(frame: NSRect(x: 0, y: 0, width: PanelMetrics.contentWidth, height: 0))
 
@@ -13,10 +16,10 @@ final class TemperatureHistoryView: NSView {
         let title = panelLabel("CPU temp · last \(minutes) min", size: 11, weight: .semibold,
                                color: .secondaryLabelColor)
         let figures = [("min", history.minimum), ("avg", history.average), ("max", history.maximum)]
-        let summary = attributedLabel(Self.summaryText(figures))
-        let chart = TemperatureChartView(history: history, now: now)
+        summary = attributedLabel(Self.summaryText(figures))
+        chart = TemperatureChartView(history: history, now: now)
 
-        for view in [title, summary, chart] {
+        for view in [title, summary!, chart!] {
             view.translatesAutoresizingMaskIntoConstraints = false
             addSubview(view)
         }
@@ -45,6 +48,12 @@ final class TemperatureHistoryView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    func update(history: TemperatureHistory, now: Date) {
+        summary.attributedStringValue = Self.summaryText([("min", history.minimum), ("avg", history.average), ("max", history.maximum)])
+        chart.update(history: history, now: now)
+        setAccessibilityLabel(Self.accessibilityText(history))
+    }
+
     static func accessibilityText(_ history: TemperatureHistory) -> String {
         let figures = [("now", history.latest), ("minimum", history.minimum),
                        ("average", history.average), ("maximum", history.maximum)]
@@ -71,8 +80,8 @@ final class TemperatureChartView: NSView {
     /// Readings further apart than this (sleep, sensor dropouts) break the line.
     static let gapThreshold: TimeInterval = 90
 
-    private let history: TemperatureHistory
-    private let now: Date
+    private var history: TemperatureHistory
+    private var now: Date
 
     init(history: TemperatureHistory, now: Date) {
         self.history = history
@@ -82,6 +91,10 @@ final class TemperatureChartView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func update(history: TemperatureHistory, now: Date) {
+        self.history = history; self.now = now; needsDisplay = true
+    }
 
     /// Rounded to 5° steps with at least 10° of range, so small wobbles do
     /// not look dramatic and the axis labels stay tidy.

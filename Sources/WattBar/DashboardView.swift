@@ -73,221 +73,304 @@ private func sizeToFit(_ view: NSView, height: CGFloat? = nil) {
     view.autoresizingMask = [.width]
 }
 
-/// Top of the menu: system draw, where the power is flowing, the key sensors
-/// and the CPU temperature chart.
-final class DashboardView: NSView {
-    init(snapshot: MenuSnapshot, updated: String?, now: Date) {
-        super.init(frame: NSRect(x: 0, y: 0, width: PanelMetrics.width, height: 0))
-        let reading = snapshot.reading
-
-        let caption = panelLabel("System draw", size: 11, color: .secondaryLabelColor)
-        let watts = reading?.systemWatts.map { String(format: "%.0f", $0) } ?? "--"
-        let hero = attributedLabel(
-            valueWithUnit(watts, unit: reading?.systemWatts == nil ? "" : "W", size: 30, weight: .semibold))
-        hero.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let state = panelLabel(reading?.powerState ?? "Measuring…", size: 11, color: .secondaryLabelColor)
-        let stamp = panelLabel(updated.map { "updated \($0)" } ?? "", size: 11, color: .tertiaryLabelColor)
-        state.alignment = .right
-        stamp.alignment = .right
-        state.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let parts = reading.map { PowerFlow.summary(for: $0) } ?? []
-        let flow = attributedLabel(Self.flowText(parts))
-
-        let cpuLoad = TileView(title: "CPU load", value: snapshot.cpuUsage.map { String(format: "%.0f", $0) } ?? "--",
-                               unit: snapshot.cpuUsage == nil ? "" : "%")
-        let memory = TileView(title: "Memory", value: snapshot.memoryPressure.map { String(format: "%.0f", $0.percentage) } ?? "--",
-                              unit: snapshot.memoryPressure == nil ? "" : "%", status: snapshot.memoryPressure?.level)
-        let cpuTemp = TileView(title: "CPU temp", value: snapshot.cpuTemperature.map { String(format: "%.0f", $0) } ?? "--",
-                               unit: snapshot.cpuTemperature == nil ? "" : "°C")
-        let gpu = TileView(title: "GPU", value: snapshot.gpuWatts.map { String(format: "%.1f", $0) } ?? "--",
-                           unit: snapshot.gpuWatts == nil ? "" : "W")
-        let rows: [[TileView]]
-        // Three over two with a fan; two equal pairs on fanless Macs.
-        if let rpm = snapshot.fanRPM {
-            let fan = rpm < 1 ? TileView(title: "Fan", value: "off", unit: "")
-                : TileView(title: "Fan", value: Int(rpm.rounded()).formatted(), unit: "rpm")
-            rows = [[cpuLoad, memory, gpu], [cpuTemp, fan]]
-        } else {
-            rows = [[cpuLoad, memory], [cpuTemp, gpu]]
+/// A menu-item control consumes mouseDown and acts once on mouseUp. Returning
+/// itself from hitTest prevents its noneditable labels swallowing the click.
+class GraphActionView: NSView {
+    var onPress: (() -> Void)? { didSet { setAccessibilityRole(onPress == nil ? .group : .button) } }
+    var graphSelected = false {
+        didSet {
+            setAccessibilityValue(graphSelected ? 1 : 0); setAccessibilitySelected(graphSelected); needsDisplay = true
         }
-        let tileGrid = NSStackView()
-        tileGrid.orientation = .vertical
-        tileGrid.alignment = .leading
-        tileGrid.spacing = 8
-        for tiles in rows {
-            let row = NSStackView(views: tiles)
-            row.orientation = .horizontal
-            row.distribution = .fillEqually
-            row.spacing = 8
-            tileGrid.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: tileGrid.widthAnchor).isActive = true
-        }
-
-        let chart = TemperatureHistoryView(history: snapshot.temperatureHistory, now: now)
-
-        for view in [caption, hero, state, stamp, flow, tileGrid, chart] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(view)
-        }
-        let inset = PanelMetrics.inset
-        NSLayoutConstraint.activate([
-            caption.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            caption.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            hero.topAnchor.constraint(equalTo: caption.bottomAnchor, constant: -1),
-            hero.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-
-            // Power state and time sit on the right, the time on the hero's baseline.
-            stamp.lastBaselineAnchor.constraint(equalTo: hero.lastBaselineAnchor),
-            stamp.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            state.bottomAnchor.constraint(equalTo: stamp.topAnchor, constant: -1),
-            state.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            state.leadingAnchor.constraint(greaterThanOrEqualTo: hero.trailingAnchor, constant: 12),
-
-            flow.topAnchor.constraint(equalTo: hero.bottomAnchor, constant: 2),
-            flow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            flow.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -inset),
-
-            tileGrid.topAnchor.constraint(equalTo: (parts.isEmpty ? hero : flow).bottomAnchor, constant: 10),
-            tileGrid.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            tileGrid.widthAnchor.constraint(equalToConstant: PanelMetrics.contentWidth),
-
-            chart.topAnchor.constraint(equalTo: tileGrid.bottomAnchor, constant: 12),
-            chart.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            chart.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6)
-        ])
-        flow.isHidden = parts.isEmpty
-        sizeToFit(self)
-
-        setAccessibilityElement(true)
-        setAccessibilityRole(.group)
-        var summary = ["System draw \(formatWatts(reading?.systemWatts))"]
-        if let reading { summary.append(reading.powerState) }
-        if let updated { summary.append("updated \(updated)") }
-        if !parts.isEmpty { summary.append(PowerFlow.summaryText(parts).replacingOccurrences(of: "→", with: "to")) }
-        summary.append("CPU load \(formatPercentage(snapshot.cpuUsage))")
-        summary.append("Memory pressure \(formatMemoryPressure(snapshot.memoryPressure))")
-        summary.append("CPU temperature \(formatCPUTemperature(snapshot.cpuTemperature))")
-        summary.append("GPU \(formatGPUWatts(snapshot.gpuWatts))")
-        if snapshot.fanRPM != nil { summary.append("Fan \(formatFanSpeed(snapshot.fanRPM))") }
-        summary.append(TemperatureHistoryView.accessibilityText(snapshot.temperatureHistory))
-        setAccessibilityLabel(summary.joined(separator: ". "))
     }
+    private(set) var hovered = false
+    private var pressed = false
+    private var hoverArea: NSTrackingArea?
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        return onPress == nil ? hit : self
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect, .enabledDuringMouseDrag],
+            owner: self)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+    func updateHover(_ inside: Bool) {
+        guard hovered != inside else { return }
+        hovered = inside; needsDisplay = true
+    }
+    override func mouseEntered(with event: NSEvent) { updateHover(true) }
+    override func mouseExited(with event: NSEvent) { updateHover(false) }
+    override func mouseDown(with event: NSEvent) { pressed = onPress != nil }
+    override func mouseUp(with event: NSEvent) {
+        let activate = pressed && bounds.contains(convert(event.locationInWindow, from: nil))
+        pressed = false
+        if activate { onPress?() }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard let onPress else { return false }
+        onPress(); return true
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        if onPress != nil && hovered {
+            NSColor.controlAccentColor.withAlphaComponent(0.09).setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7).fill()
+        }
+        if graphSelected {
+            NSColor.controlAccentColor.withAlphaComponent(0.7).setStroke()
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.75, dy: 0.75), xRadius: 7, yRadius: 7)
+            path.lineWidth = 1.5; path.stroke()
+        }
+    }
+}
 
+/// Geometry and the set of sensors are chosen once, when the menu opens.
+final class DashboardView: NSView {
+    let heroBlock = GraphActionView()
+    let flowBlock = GraphActionView()
+    let cpu = TileView(title: "CPU")
+    let memory = TileView(title: "Memory")
+    let gpu = TileView(title: "GPU")
+    private let fan: TileView?
+    private let hero = attributedLabel(NSAttributedString())
+    private let state = panelLabel("", size: 11, color: .secondaryLabelColor)
+    private let stamp = panelLabel("", size: 11, color: .tertiaryLabelColor)
+    private let flow = attributedLabel(NSAttributedString())
+    private let chart: TemperatureHistoryView
+    private let compactTiles: Bool
+    var onSelectMetric: ((GraphMetric) -> Void)?
+    private var selected: GraphMetric = .off
+    private var cpuReadingLabel = ""
+
+    init(snapshot: MenuSnapshot, updated: String?, now: Date) {
+        compactTiles = snapshot.fanRPM == nil
+        fan = snapshot.fanRPM == nil ? nil : TileView(title: "Fan")
+        chart = TemperatureHistoryView(history: snapshot.temperatureHistory, now: now)
+        let height: CGFloat = (snapshot.fanRPM == nil ? 154 : 212) + chart.frame.height + 6
+        super.init(frame: NSRect(x: 0, y: 0, width: PanelMetrics.width, height: height))
+        autoresizingMask = [.width]
+        func place(_ view: NSView, x: CGFloat, top: CGFloat, width: CGFloat, height: CGFloat, in parent: NSView) {
+            view.frame = NSRect(x: x, y: parent.bounds.height - top - height, width: width, height: height)
+            parent.addSubview(view)
+        }
+        place(heroBlock, x: 10, top: 2, width: 120, height: 57, in: self)
+        place(
+            panelLabel("System draw", size: 11, color: .secondaryLabelColor), x: 6, top: 3, width: 108, height: 16,
+            in: heroBlock)
+        place(hero, x: 6, top: 16, width: 108, height: 38, in: heroBlock)
+        place(state, x: 136, top: 10, width: 168, height: 16, in: self)
+        place(stamp, x: 136, top: 29, width: 168, height: 16, in: self)
+        state.alignment = .right; stamp.alignment = .right
+        place(flowBlock, x: 10, top: 60, width: 300, height: 24, in: self)
+        place(flow, x: 6, top: 3, width: 288, height: 18, in: flowBlock)
+        let rows = fan.map { [[cpu, memory], [gpu, $0]] } ?? [[cpu, memory, gpu]]
+        for (index, tiles) in rows.enumerated() {
+            let row = NSStackView(views: tiles)
+            row.orientation = .horizontal; row.distribution = .fillEqually; row.spacing = 8
+            row.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(row)
+            NSLayoutConstraint.activate([
+                row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+                row.topAnchor.constraint(equalTo: topAnchor, constant: 92 + CGFloat(index) * 58),
+                row.widthAnchor.constraint(equalToConstant: 288), row.heightAnchor.constraint(equalToConstant: 50),
+            ])
+        }
+        place(chart, x: 16, top: compactTiles ? 154 : 212, width: 288, height: chart.frame.height, in: self)
+        setAccessibilityElement(true); setAccessibilityRole(.group)
+        heroBlock.onPress = { [weak self] in self?.onSelectMetric?(.systemDraw) }
+        cpu.onPress = { [weak self] in
+            guard let self else { return }
+            self.onSelectMetric?(self.selected == .cpuUsage ? .cpuTemperature : .cpuUsage)
+        }
+        memory.onPress = { [weak self] in self?.onSelectMetric?(.memoryPressure) }
+        gpu.onPress = { [weak self] in self?.onSelectMetric?(.gpuDraw) }
+        update(snapshot: snapshot, updated: updated, now: now)
+    }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    func select(_ metric: GraphMetric) {
+        selected = metric
+        heroBlock.graphSelected = metric == .systemDraw
+        flowBlock.graphSelected = metric == .batteryFlow && flowBlock.onPress != nil
+        cpu.graphSelected = metric == .cpuUsage || metric == .cpuTemperature
+        memory.graphSelected = metric == .memoryPressure
+        gpu.graphSelected = metric == .gpuDraw
+        cpu.setAccessibilityLabel(
+            (metric == .cpuUsage ? "Graph CPU temperature in the menu bar. " : "Graph CPU usage in the menu bar. ")
+                + cpuReadingLabel)
+    }
+
+    func update(snapshot: MenuSnapshot, updated: String?, now: Date) {
+        let reading = snapshot.reading
+        hero.attributedStringValue = valueWithUnit(
+            reading?.systemWatts.map { String(format: "%.0f", $0) } ?? "--",
+            unit: reading?.systemWatts == nil ? "" : "W", size: 30, weight: .semibold)
+        state.stringValue = reading?.powerState ?? "Measuring…"
+        stamp.stringValue = updated.map { "updated \($0)" } ?? ""
+        let parts = reading.map { PowerFlow.summary(for: $0) } ?? []
+        flow.attributedStringValue = Self.flowText(parts)
+        flowBlock.onPress = hasSystemBattery(reading) ? { [weak self] in self?.onSelectMetric?(.batteryFlow) } : nil
+        heroBlock.setAccessibilityElement(true)
+        heroBlock.setAccessibilityLabel("Graph System draw in the menu bar, \(formatWatts(reading?.systemWatts))")
+        flowBlock.setAccessibilityElement(true)
+        flowBlock.setAccessibilityLabel(
+            (hasSystemBattery(reading) ? "Graph Battery charge or drain in the menu bar. " : "")
+                + PowerFlow.summaryText(parts))
+        let load = snapshot.cpuUsage.map { String(format: "%.0f%%", $0) } ?? "--"
+        let temp = snapshot.cpuTemperature.map { String(format: "%.0f°C", $0) } ?? "--"
+        let cpuText = NSMutableAttributedString(
+            string: load + " · ",
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: compactTiles ? 11 : 16, weight: .semibold),
+                .foregroundColor: NSColor.labelColor,
+            ])
+        cpuText.append(
+            NSAttributedString(
+                string: temp,
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: compactTiles ? 11 : 16, weight: .semibold),
+                    .foregroundColor: StatusWarning.cpuIsHot(snapshot.cpuTemperature)
+                        ? NSColor.systemOrange : NSColor.labelColor,
+                ]))
+        cpuReadingLabel =
+            "CPU load \(formatPercentage(snapshot.cpuUsage)), CPU temperature \(formatCPUTemperature(snapshot.cpuTemperature))"
+        cpu.show(
+            cpuText,
+            label:
+                "Graph CPU usage or temperature in the menu bar. CPU load \(formatPercentage(snapshot.cpuUsage)), CPU temperature \(formatCPUTemperature(snapshot.cpuTemperature))"
+        )
+        memory.status = snapshot.memoryPressure?.level
+        memory.show(
+            valueWithUnit(
+                snapshot.memoryPressure.map { String(format: "%.0f", $0.percentage) } ?? "--",
+                unit: snapshot.memoryPressure == nil ? "" : "%", size: 17, weight: .semibold),
+            label: "Graph Memory pressure in the menu bar. \(formatMemoryPressure(snapshot.memoryPressure))")
+        gpu.show(
+            valueWithUnit(
+                snapshot.gpuWatts.map { String(format: "%.1f", $0) } ?? "--", unit: snapshot.gpuWatts == nil ? "" : "W",
+                size: 17, weight: .semibold),
+            label: "Graph GPU draw in the menu bar. \(formatGPUWatts(snapshot.gpuWatts))")
+        fan?.show(
+            valueWithUnit(
+                snapshot.fanRPM.map { $0 < 1 ? "off" : Int($0.rounded()).formatted() } ?? "--",
+                unit: (snapshot.fanRPM ?? 0) < 1 ? "" : "rpm", size: 17, weight: .semibold),
+            label: "Fan \(formatFanSpeed(snapshot.fanRPM))")
+        chart.update(history: snapshot.temperatureHistory, now: now)
+        select(selected)
+        setAccessibilityLabel(
+            [
+                "System draw \(formatWatts(reading?.systemWatts))", state.stringValue, stamp.stringValue,
+                PowerFlow.summaryText(parts).replacingOccurrences(of: "→", with: "to"), cpu.accessibilityLabel() ?? "",
+                "Memory pressure \(formatMemoryPressure(snapshot.memoryPressure))",
+                "GPU \(formatGPUWatts(snapshot.gpuWatts))",
+                fan?.accessibilityLabel() ?? "",
+                TemperatureHistoryView.accessibilityText(snapshot.temperatureHistory),
+            ].joined(separator: ". "))
+    }
+
     private static func flowText(_ parts: [PowerFlow.Part]) -> NSAttributedString {
         let dim: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor
+            .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor,
         ]
         let text = NSMutableAttributedString()
         for (index, part) in parts.enumerated() {
-            if index > 0 { text.append(NSAttributedString(string: PowerFlow.separator(before: index), attributes: dim)) }
-            let color: NSColor
-            switch part.tone {
-            case .neutral: color = .labelColor
-            case .charging: color = .systemGreen
-            case .draining: color = .systemOrange
+            if index > 0 {
+                text.append(NSAttributedString(string: PowerFlow.separator(before: index), attributes: dim))
             }
             text.append(NSAttributedString(string: part.label + " ", attributes: dim))
-            text.append(NSAttributedString(string: part.value, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold), .foregroundColor: color
-            ]))
+            text.append(
+                NSAttributedString(
+                    string: part.value,
+                    attributes: [
+                        .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+                        .foregroundColor: part.tone == .charging
+                            ? NSColor.systemGreen : part.tone == .draining ? NSColor.systemOrange : NSColor.labelColor,
+                    ]))
         }
         return text
     }
 }
 
-/// One sensor reading on a tinted rounded background.
-final class TileView: NSView {
-    let status: MemoryPressureLevel?
-
-    init(title: String, value: String, unit: String, status: MemoryPressureLevel? = nil) {
-        self.status = status
+final class TileView: GraphActionView {
+    var status: MemoryPressureLevel? { didSet { needsDisplay = true } }
+    private let figure = attributedLabel(NSAttributedString())
+    init(title: String) {
         super.init(frame: .zero)
         let name = panelLabel(title, size: 11, color: .secondaryLabelColor)
-        let figure = attributedLabel(valueWithUnit(value, unit: unit, size: 17, weight: .semibold))
-        for view in [name, figure] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(view)
-        }
+        for view in [name, figure] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
         figure.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         NSLayoutConstraint.activate([
             name.topAnchor.constraint(equalTo: topAnchor, constant: 6),
             name.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            name.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: status == nil ? -6 : -20),
-            figure.topAnchor.constraint(equalTo: name.bottomAnchor, constant: 0),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -20),
+            figure.topAnchor.constraint(equalTo: name.bottomAnchor),
             figure.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            figure.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
-            figure.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6)
+            figure.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            figure.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
         ])
         setAccessibilityElement(true)
-        setAccessibilityLabel(("\(title) \(value) \(unit)" + (status.map { ", \($0.title) pressure" } ?? "")).trimmingCharacters(in: .whitespaces))
     }
-
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
+    func show(_ text: NSAttributedString, label: String) {
+        figure.attributedStringValue = text; setAccessibilityLabel(label)
+    }
     override func draw(_ dirtyRect: NSRect) {
-        PanelMetrics.tint.setFill()
-        NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
+        PanelMetrics.tint.setFill(); NSBezierPath(roundedRect: bounds, xRadius: 8, yRadius: 8).fill()
+        super.draw(dirtyRect)
         if let status {
-            let color: NSColor
-            switch status {
-            case .normal: color = .systemGreen
-            case .warning: color = .systemYellow
-            case .critical: color = .systemRed
-            case .unknown: color = .secondaryLabelColor
-            }
-            color.setFill()
+            let color: NSColor =
+                status == .normal
+                ? .systemGreen
+                : status == .warning ? .systemYellow : status == .critical ? .systemRed : .secondaryLabelColor
+            color.setFill();
             NSBezierPath(ovalIn: NSRect(x: bounds.maxX - 14, y: bounds.maxY - 16, width: 6, height: 6)).fill()
         }
     }
 }
 
-/// Two-line summary row: a section name with its headline value, then a
-/// dimmed detail line underneath.
-final class SummaryRowView: NSView {
-    init(title: String, value: String, detailTitle: String, detailValue: String) {
-        super.init(frame: .zero)
-        let size = PanelMetrics.menuFontSize
-        let cells = [
-            panelLabel(title, size: size),
-            panelLabel(value, size: size),
-            panelLabel(detailTitle, size: 11, color: .secondaryLabelColor),
-            panelLabel(detailValue, size: 11, color: .secondaryLabelColor)
-        ]
-        for cell in cells {
-            cell.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(cell)
-        }
-        cells[1].alignment = .right
-        cells[3].alignment = .right
-        cells[1].setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        cells[3].setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let inset = PanelMetrics.inset
-        NSLayoutConstraint.activate([
-            cells[0].topAnchor.constraint(equalTo: topAnchor, constant: 3),
-            cells[0].leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            cells[1].firstBaselineAnchor.constraint(equalTo: cells[0].firstBaselineAnchor),
-            cells[1].trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            cells[1].leadingAnchor.constraint(greaterThanOrEqualTo: cells[0].trailingAnchor, constant: 8),
-            cells[2].topAnchor.constraint(equalTo: cells[0].bottomAnchor, constant: 1),
-            cells[2].leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            cells[2].bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
-            cells[3].firstBaselineAnchor.constraint(equalTo: cells[2].firstBaselineAnchor),
-            cells[3].trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            cells[3].leadingAnchor.constraint(greaterThanOrEqualTo: cells[2].trailingAnchor, constant: 8)
-        ])
-        sizeToFit(self)
-        setAccessibilityElement(true)
-        setAccessibilityRole(.group)
-        setAccessibilityLabel("\(title): \(value). \(detailTitle): \(detailValue)")
+/// Fixed-height two-line summary, updated without replacing the menu item.
+final class SummaryRowView: GraphActionView {
+    var actionLabel: String? { didSet { updateAccessibilityLabel() } }
+    private var summaryLabel = ""
+    private func updateAccessibilityLabel() {
+        setAccessibilityLabel([actionLabel, summaryLabel].compactMap { $0 }.joined(separator: ". "))
     }
-
+    private var cells: [NSTextField] = []
+    init(title: String, value: String, detailTitle: String, detailValue: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: PanelMetrics.width, height: 39))
+        autoresizingMask = [.width]
+        cells = [
+            panelLabel(title, size: PanelMetrics.menuFontSize), panelLabel(value, size: PanelMetrics.menuFontSize),
+            panelLabel(detailTitle, size: 11, color: .secondaryLabelColor),
+            panelLabel(detailValue, size: 11, color: .secondaryLabelColor),
+        ]
+        for cell in cells { addSubview(cell) }
+        cells[1].alignment = .right; cells[3].alignment = .right
+        setAccessibilityElement(true); setAccessibilityRole(.group)
+        update(title: title, value: value, detailTitle: detailTitle, detailValue: detailValue)
+    }
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    func update(title: String, value: String, detailTitle: String, detailValue: String) {
+        for (cell, text) in zip(cells, [title, value, detailTitle, detailValue]) { cell.stringValue = text }
+        summaryLabel = "\(title): \(value). \(detailTitle): \(detailValue)"
+        updateAccessibilityLabel()
+        needsLayout = true
+    }
+    override func layout() {
+        super.layout()
+        for row in 0..<2 {
+            let left = cells[row * 2], right = cells[row * 2 + 1]
+            let width = min(100, ceil((left.stringValue as NSString).size(withAttributes: [.font: left.font!]).width) + 4)
+            left.frame = NSRect(x: 16, y: row == 0 ? 20 : 4, width: width, height: 16)
+            right.frame = NSRect(x: 16 + width + 8, y: row == 0 ? 20 : 4, width: bounds.width - 40 - width, height: 16)
+        }
+    }
 }
 
 /// Heading for the busiest-apps list, with its column legend on the right.

@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
     private var latestCPUUsage: Double?
     private var latestMemoryPressure: MemoryPressureReading?
     private var menuIsOpen = false
+    private var livePanel: LiveMenuPanel?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         let bundleIdentifier = Bundle.main.bundleIdentifier ?? "local.codex.wattbar"
@@ -52,14 +53,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
         if let statusItem {
             displayController = StatusDisplayController(statusItem: statusItem, settings: settings)
         }
-        // Left-click switches between the icon and the full readout; right-click
-        // or Control-click opens the menu, which is filled in menuNeedsUpdate.
+        // Every click opens the panel, filled in menuNeedsUpdate.
         let menu = NSMenu(title: "WattBar")
-        menu.delegate = self
-        statusMenu = menu
-        statusItem?.button?.target = self
-        statusItem?.button?.action = #selector(handleStatusItemClick)
-        statusItem?.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        if let statusItem { configureStatusMenu(item: statusItem, menu: menu) }
 
         activeAppLoader.onUpdate = { [weak self] in
             guard let self, self.menuIsOpen, self.settings.showActiveApps,
@@ -102,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
         if graphHistory.peaks != peaks { settings.graphPeaks = graphHistory.peaks }
 
         updateStatusTitle()
+        if menuIsOpen { livePanel?.update(menuSnapshot()) }
     }
 
     @objc func quit() {
@@ -125,17 +122,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
         updateStatusTitle()
     }
 
-    @objc func handleStatusItemClick() {
-        guard let event = NSApp.currentEvent else { return }
-        if event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
-            openStatusMenu()
-        } else {
-            toggleCompactMenuBar()
-        }
+    func configureStatusMenu(item: NSStatusItem, menu: NSMenu) {
+        statusItem = item; statusMenu = menu
+        menu.delegate = self
+        item.button?.target = self
+        item.button?.action = #selector(handleStatusItemClick)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
-    /// Attaching the menu only for this click lets AppKit position and
-    /// highlight it natively while plain clicks keep toggling the display.
+    @objc func handleStatusItemClick() {
+        openStatusMenu()
+    }
+
+    /// Attach only for the click so AppKit positions and highlights it natively.
     private func openStatusMenu() {
         guard !menuIsOpen, let menu = statusMenu, let statusItem else { return }
         statusItem.menu = menu
@@ -155,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
     @objc func setGraphMetric(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let metric = GraphMetric(rawValue: raw) else { return }
         settings.graphMetric = metric
+        livePanel?.syncSelection()
         updateStatusTitle()
     }
 
@@ -258,8 +258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
     }
 
     private func updateStatusTitle() {
-        // Resizing the anchor during menu tracking causes AppKit flicker.
-        guard !menuIsOpen else { return }
+        // Readings redraw while tracking; the controller defers width changes.
         displayController?.update(reading: latestReading, gpuWatts: latestGPUWatts,
             cpuTemperature: latestCPUTemperature, fanRPM: latestFanRPM, network: latestNetworkSpeed,
             uptime: ProcessInfo.processInfo.systemUptime, graph: graphHistory,
@@ -268,24 +267,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, WattBa
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === statusMenu else { return }
-        // Keep this snapshot stable during tracking; collect a fresh one next time.
+        guard !menuIsOpen else { return }
         activeAppLoader.refreshIfNeeded()
-        let snapshot = MenuSnapshot(reading: latestReading, gpuWatts: latestGPUWatts,
+        livePanel = StatusMenuBuilder(settings: settings, snapshot: menuSnapshot(), actions: self).populate(menu)
+    }
+
+    private func menuSnapshot() -> MenuSnapshot {
+        MenuSnapshot(reading: latestReading, gpuWatts: latestGPUWatts,
             cpuTemperature: latestCPUTemperature, fanRPM: latestFanRPM, network: latestNetworkSpeed,
             activeApps: activeAppLoader.apps, energy: energyTracker.accumulator,
             uptime: ProcessInfo.processInfo.systemUptime, temperatureHistory: temperatureHistory,
             cpuUsage: latestCPUUsage, memoryPressure: latestMemoryPressure)
-        StatusMenuBuilder(settings: settings, snapshot: snapshot, actions: self).populate(menu)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        guard menu === statusMenu else { return }
         menuIsOpen = true
+        livePanel?.startTracking()
+        displayController?.isMenuTracking = true
     }
 
     func menuDidClose(_ menu: NSMenu) {
         guard menu === statusMenu else { return }
         statusItem?.menu = nil
         menuIsOpen = false
+        livePanel = nil
+        displayController?.isMenuTracking = false
         updateStatusTitle()
     }
 
