@@ -17,6 +17,20 @@ enum GraphMetric: String, CaseIterable {
         }
     }
 
+    /// Symbols available on macOS 13, with a runtime fallback in the renderer.
+    var symbolName: String {
+        switch self {
+        case .systemDraw: return "bolt.fill"
+        case .cpuUsage: return "cpu"
+        case .memoryPressure: return "memorychip"
+        case .cpuTemperature: return "thermometer.medium"
+        case .gpuDraw: return "display"
+        case .networkDownload: return "arrow.down"
+        case .batteryFlow: return "battery.75"
+        case .off: return ""
+        }
+    }
+
     /// Smallest full-scale value, so a fresh install does not draw tall bars
     /// at idle. Nil for the temperature line, which scales to its own range.
     var scaleFloor: Double? {

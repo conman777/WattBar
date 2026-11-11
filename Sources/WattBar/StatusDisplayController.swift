@@ -3,6 +3,32 @@ import Cocoa
 final class StatusDisplayController {
     private let statusItem: NSStatusItem
     private let settings: AppSettings
+    private struct LayoutSettings {
+        let compact, label, charging, network: Bool
+        let metric: GraphMetric
+        init(_ settings: AppSettings) {
+            compact = settings.compactMenuBar; label = settings.showMenuBarLabel
+            charging = settings.showChargingRate; network = settings.showNetworkSpeeds
+            metric = settings.graphMetric
+        }
+    }
+    private var trackingLayout: LayoutSettings?
+    var isMenuTracking = false {
+        didSet {
+            trackingLayout = isMenuTracking ? LayoutSettings(settings) : nil
+            contentView.isHighlighted = isMenuTracking
+        }
+    }
+    private var compact: Bool { trackingLayout?.compact ?? settings.compactMenuBar }
+    private var showLabel: Bool { trackingLayout?.label ?? settings.showMenuBarLabel }
+    private var showCharging: Bool { trackingLayout?.charging ?? settings.showChargingRate }
+    private var showNetwork: Bool { trackingLayout?.network ?? settings.showNetworkSpeeds }
+    private var graphMetric: GraphMetric {
+        guard let trackingLayout else { return settings.graphMetric }
+        if trackingLayout.metric == .off { return .off }
+        return settings.graphMetric == .off
+            ? (contentView.content.graph?.metric ?? trackingLayout.metric) : settings.graphMetric
+    }
     private let statusFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
     /// Draws the full readout (graph and columns) on top of the status button.
     let contentView = StatusContentView()
@@ -35,10 +61,10 @@ final class StatusDisplayController {
     func update(reading latestReading: PowerReading?, gpuWatts latestGPUWatts: Double?, cpuTemperature latestCPUTemperature: Double?, fanRPM latestFanRPM: Double?, network latestNetworkSpeed: NetworkSpeedReading?, uptime: TimeInterval, graph: GraphHistory = GraphHistory(), cpuUsage: Double? = nil, memoryPressure: MemoryPressureReading? = nil) {
         guard let reading = latestReading else {
             applyStatusPresentation(
-                length: settings.compactMenuBar ? 28 : NSStatusItem.variableLength,
-                image: settings.compactMenuBar ? compactStatusImage : nil,
+                length: compact ? 28 : NSStatusItem.variableLength,
+                image: compact ? compactStatusImage : nil,
                 attributedTitle: NSAttributedString(
-                    string: settings.compactMenuBar ? "" : "WattBar",
+                    string: compact ? "" : "WattBar",
                     attributes: [.font: statusFont]
                 ),
                 content: nil,
@@ -62,7 +88,7 @@ final class StatusDisplayController {
             "Computer uptime \(formatSystemUptime(uptime))"
         ].joined(separator: " | ")
 
-        guard !settings.compactMenuBar else {
+        guard !compact else {
             applyStatusPresentation(length: 28, image: compactStatusImage, attributedTitle: NSAttributedString(),
                                     content: nil, accessibilityLabel: "WattBar \(accessibleTitle)")
             return
@@ -91,7 +117,7 @@ final class StatusDisplayController {
         // monospaced, so "888" covers any three-digit value). Without this the
         // status item resizes, and shifts its neighbours, as values change.
         var columns: [StatusContent.Column] = []
-        if settings.showMenuBarLabel {
+        if showLabel {
             columns.append(.init(top: Field("WATT", "", .primary), bottom: nil, reserve: []))
         }
         columns.append(.init(
@@ -99,7 +125,7 @@ final class StatusDisplayController {
             bottom: Field("CPU", cpuTemperature.map { String(format: "%.0f°", $0) } ?? "--°", .primary, warning: cpuHot),
             reserve: [Field("SYS", "888W", .primary), Field("CPU", "88°", .primary)]
         ))
-        if settings.showChargingRate {
+        if showCharging {
             let flow = PowerFlow(adapterInputWatts: reading.adapterInputWatts, batteryFlowWatts: reading.batteryFlowWatts)
             drainHigh = StatusWarning.batteryDrainIsHigh(flow)
             columns.append(.init(
@@ -112,7 +138,7 @@ final class StatusDisplayController {
             columns.append(.init(top: Field("GPU", gpu, .secondary), bottom: nil,
                                  reserve: [Field("GPU", "88W", .secondary)]))
         }
-        if settings.showNetworkSpeeds {
+        if showNetwork {
             columns.append(.init(
                 top: Field("↓", formatStackedNetworkSpeed(network?.downloadBytesPerSecond), .secondary),
                 bottom: Field("↑", formatStackedNetworkSpeed(network?.uploadBytesPerSecond), .secondary),
@@ -120,7 +146,7 @@ final class StatusDisplayController {
             ))
         }
 
-        let metric = settings.graphMetric.resolved(hasBattery: hasSystemBattery(reading))
+        let metric = graphMetric.resolved(hasBattery: hasSystemBattery(reading))
         let style = settings.graphStyle
         let tint: StatusContent.Graph.Tint
         switch metric {
@@ -156,6 +182,9 @@ final class StatusDisplayController {
         guard let button = statusItem.button else { return }
 
         button.setAccessibilityLabel(accessibilityLabel)
+        // Defer a setting that would resize the anchor until tracking ends.
+        // Same-width metric/style changes and fresh values still redraw now.
+        if isMenuTracking && statusItem.length != length { return }
         // New readings only redraw the content view; the button itself changes
         // when the mode or the reserved width does.
         if let content { contentView.content = content }
@@ -243,6 +272,8 @@ struct StatusContent: Equatable {
 /// which a template image would flatten.
 final class StatusContentView: NSView {
     static let graphWidth: CGFloat = 32
+    static let glyphWidth: CGFloat = 11
+    static let glyphGap: CGFloat = 3
     static let graphGap: CGFloat = 8
     static let columnGap: CGFloat = 10
     static let labelGap: CGFloat = 3
@@ -252,6 +283,8 @@ final class StatusContentView: NSView {
     static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular)
     static let primaryFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
     static let secondaryFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+
+    var isHighlighted = false { didSet { needsDisplay = true } }
 
     var content = StatusContent(graph: nil, columns: []) {
         didSet { if content != oldValue { needsDisplay = true } }
@@ -292,7 +325,7 @@ final class StatusContentView: NSView {
     static func layout(_ content: StatusContent) -> Layout {
         // Off gives the graph's width back; every other choice takes the same slot.
         let graphX: CGFloat? = content.graph == nil ? nil : 0
-        var x: CGFloat = graphX == nil ? 0 : graphWidth + graphGap
+        var x: CGFloat = graphX == nil ? 0 : graphWidth + glyphWidth + glyphGap + graphGap
         var placements: [Placement] = []
         for (index, column) in content.columns.enumerated() {
             if index > 0 { x += columnGap }
@@ -314,25 +347,42 @@ final class StatusContentView: NSView {
 
         if let graph = content.graph, let graphX = layout.graphX {
             let top = topBaseline + Self.primaryFont.capHeight
-            MenuBarGraphDrawing.draw(graph, in: NSRect(x: origin + graphX, y: bottomBaseline,
-                                                       width: Self.graphWidth, height: top - bottomBaseline))
+            if let glyph = Self.glyph(for: graph.metric) {
+                let rect = NSRect(x: origin + graphX, y: bounds.midY - 5.5, width: Self.glyphWidth, height: 11)
+                let tinted = NSImage(size: rect.size, flipped: false) { bounds in
+                    MenuBarGraphDrawing.color(for: graph, highlighted: self.isHighlighted).setFill(); bounds.fill()
+                    glyph.draw(in: bounds, from: .zero, operation: .destinationIn, fraction: 1)
+                    return true
+                }
+                tinted.draw(in: rect)
+            }
+            MenuBarGraphDrawing.draw(graph, in: NSRect(x: origin + graphX + Self.glyphWidth + Self.glyphGap, y: bottomBaseline,
+                                                       width: Self.graphWidth, height: top - bottomBaseline), highlighted: isHighlighted)
         }
 
         for (column, placement) in zip(content.columns, layout.columns) {
             for (field, baseline) in [(column.top, topBaseline), (column.bottom, bottomBaseline)] {
                 guard let field else { continue }
-                draw(field.label, font: Self.labelFont, color: .secondaryLabelColor,
+                draw(field.label, font: Self.labelFont, color: isHighlighted ? .selectedMenuItemTextColor : .secondaryLabelColor,
                      x: origin + placement.x, baseline: baseline)
                 let color: NSColor
                 if field.warning {
                     color = .systemOrange
                 } else {
-                    color = field.emphasis == .primary ? .labelColor : NSColor.labelColor.withAlphaComponent(0.8)
+                    color = isHighlighted ? .selectedMenuItemTextColor
+                        : field.emphasis == .primary ? .labelColor : NSColor.labelColor.withAlphaComponent(0.8)
                 }
                 draw(field.value, font: Self.font(field.emphasis), color: color,
                      x: origin + placement.valueX, baseline: baseline)
             }
         }
+    }
+
+    static func glyph(for metric: GraphMetric) -> NSImage? {
+        guard metric != .off else { return nil }
+        let image = NSImage(systemSymbolName: metric.symbolName, accessibilityDescription: metric.title)
+            ?? NSImage(systemSymbolName: "chart.xyaxis.line", accessibilityDescription: metric.title)
+        return image?.withSymbolConfiguration(.init(pointSize: 10, weight: .medium)) ?? image
     }
 
     private func draw(_ text: String, font: NSFont, color: NSColor, x: CGFloat, baseline: CGFloat) {
@@ -350,17 +400,17 @@ enum MenuBarGraphDrawing {
     static let barWidth: CGFloat = 2
     static let lineWidth: CGFloat = 1.2
 
-    static func color(for graph: StatusContent.Graph) -> NSColor {
+    static func color(for graph: StatusContent.Graph, highlighted: Bool = false) -> NSColor {
         switch graph.tint {
-        case .monochrome: return NSColor.labelColor.withAlphaComponent(0.75)
+        case .monochrome: return (highlighted ? NSColor.selectedMenuItemTextColor : .labelColor).withAlphaComponent(0.75)
         case .orange: return .systemOrange
         case .yellow: return .systemYellow
         case .red: return .systemRed
         }
     }
 
-    static func draw(_ graph: StatusContent.Graph, in rect: NSRect) {
-        let color = color(for: graph)
+    static func draw(_ graph: StatusContent.Graph, in rect: NSRect, highlighted: Bool = false) {
+        let color = color(for: graph, highlighted: highlighted)
         let count = graph.bars.count
         guard count > 1 else { return }
         let step = (rect.width - barWidth) / CGFloat(count - 1)
@@ -368,7 +418,7 @@ enum MenuBarGraphDrawing {
 
         // A hairline marks the zero (or, for temperature, the bottom) of the graph.
         let baselineY = graph.metric == .batteryFlow ? (rect.midY * 2).rounded() / 2 : rect.minY
-        NSColor.tertiaryLabelColor.setFill()
+        (highlighted ? NSColor.selectedMenuItemTextColor.withAlphaComponent(0.3) : .tertiaryLabelColor).setFill()
         NSRect(x: rect.minX, y: baselineY - 0.25, width: rect.width, height: 0.5).fill()
 
         if graph.style == .line {
