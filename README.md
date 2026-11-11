@@ -8,13 +8,49 @@ The macOS version displays:
 - Total system draw reported by `SystemLoad`
 - Charger input reported by `SystemPowerIn`
 - Battery charging or discharging power
+- CPU usage across all cores (user + system + nice), available after the first sampling interval
+- Memory pressure: percentage from `100 − kern.memorystatus_level`, with the system normal/warning/critical level from `kern.memorystatus_vm_pressure_level` (not plain memory used)
 - Estimated GPU power
 - Computer uptime, shown in days, hours, and minutes
-- CPU temperature
+- CPU temperature, with a chart of the last hour in the menu (kept in memory, so it restarts with the app)
 - Optional live download and upload speeds in the menu bar, with session totals in the menu
-- Optional compact menu-bar icon with full readings available on hover; left-click toggles compact/full mode and right-click opens the menu
+- Fan speed in the menu, shown as off when the fan has stopped and hidden on fanless Macs
+- Optional icon-only mode; left-click switches between the icon and the full readout, and right-click (or Control-click) opens the menu
 - Optional accumulated energy, tracking time, and electricity costs
 - The most active applications by CPU and memory usage
+
+## macOS menu bar and menu
+
+The full menu bar readout starts with a small graph of the last five minutes,
+followed by stacked columns: system draw over CPU temperature, then (optionally)
+adapter input or battery drain over GPU draw, and download over upload speed.
+Columns keep a fixed width, so the item does not shift as readings change. A
+value turns orange only when it needs attention: CPU at 85 °C or more, or the
+battery draining at 40 W or more; the original graphs turn orange with it.
+The CPU Usage graph turns orange at 90% usage; Memory Pressure stays monochrome
+at normal, yellow at warning and red at critical, following the system level.
+
+Choose what the graph shows under **Menu Bar Display › Graph**: System Draw
+(the default), CPU Usage, Memory Pressure, CPU Temperature, GPU Draw, Network
+Download, Battery
+Charge/Drain (Macs with a battery only), or Off, and under **Style** whether it
+is a line (the default) or bars. Every graph takes the same width; Off removes
+the graph and gives that width back. CPU Usage and Memory Pressure use a fixed 0–100% scale. The line has a
+point for every 15 seconds (30
+seconds at the slowest refresh) and breaks where readings are missing; each bar
+averages 30 seconds. Power and network readings are scaled from zero to the
+highest value WattBar has seen for that reading, which is remembered across
+launches; battery charge/drain is drawn around a zero line, and CPU temperature
+over its recent range. The history itself is kept in memory and starts empty
+after launch.
+
+The menu opens with a dashboard: system draw, where the power is flowing (for
+example `Adapter 61 W → Mac 42 W · Battery +19 W`), CPU load, memory pressure,
+CPU temperature, GPU and fan tiles in two rows, and the CPU temperature chart.
+Memory has a green/yellow/red status dot for normal/warning/critical; the fan
+tile is omitted on fanless Macs. Network, energy and cost, and the busiest apps
+follow. **Reading Details** holds the telemetry source, battery details, power
+state, CPU usage, memory pressure and computer uptime.
 
 ## macOS requirements
 

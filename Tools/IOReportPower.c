@@ -3,6 +3,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "WattBarSensors.h"
+
 extern CFMutableDictionaryRef IOReportCopyChannelsInGroup(CFStringRef group, CFStringRef subgroup, uint64_t channel_id, uint64_t options, uint64_t flags);
 extern CFMutableDictionaryRef IOReportCreateSubscription(void *unused, CFMutableDictionaryRef desiredChannels, CFMutableDictionaryRef *subscribedChannels, uint64_t channel_id, CFTypeRef options);
 extern CFDictionaryRef IOReportCreateSamples(CFMutableDictionaryRef subscription, CFMutableDictionaryRef channels, CFTypeRef options);
