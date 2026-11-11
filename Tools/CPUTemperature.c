@@ -7,6 +7,8 @@
 #endif
 #include <string.h>
 
+#include "WattBarSensors.h"
+
 // Apple's SMC interface is private, just like the IOReport interface used by
 // WattBar's GPU reader. Failures are reported as unavailable to the Swift UI.
 
@@ -44,10 +46,30 @@ typedef struct {
     uint8_t bytes[32];
 } SMCKeyData;
 
+#define CPU_KEY_CAPACITY 256
+// SMC result code for a key this Mac does not have.
+#define SMC_KEY_NOT_FOUND 132
+
 static io_connect_t connection;
-static uint32_t cpu_keys[256];
+static uint32_t cpu_keys[CPU_KEY_CAPACITY];
 static size_t cpu_key_count;
 static int keys_discovered;
+
+// Sensor metadata is stable; temperature values are still fetched on every read.
+// Keys the SMC reports as missing are cached with data_size 0 so the preferred
+// keys absent on most Macs cost one lookup per launch, not one per refresh.
+// Room for every discovered CPU key plus the preferred keys, #KEY and fan keys.
+static struct { uint32_t key; SMCKeyInfo info; } key_info_cache[CPU_KEY_CAPACITY + 16];
+static size_t key_info_count;
+
+static void forget_key_info(uint32_t key) {
+    for (size_t index = 0; index < key_info_count; index++) {
+        if (key_info_cache[index].key == key) {
+            key_info_cache[index] = key_info_cache[--key_info_count];
+            return;
+        }
+    }
+}
 
 static uint32_t fourcc(const char name[4]) {
     return ((uint32_t)(uint8_t)name[0] << 24)
@@ -94,13 +116,35 @@ static int setup_smc(void) {
     return connection != IO_OBJECT_NULL;
 }
 
+static void cache_key_info(uint32_t key, SMCKeyInfo info) {
+    if (key_info_count < sizeof(key_info_cache) / sizeof(key_info_cache[0])) {
+        key_info_cache[key_info_count].key = key;
+        key_info_cache[key_info_count++].info = info;
+    }
+}
+
 static int read_key_info(uint32_t key, SMCKeyInfo *info) {
+    for (size_t index = 0; index < key_info_count; index++) {
+        if (key_info_cache[index].key == key) {
+            *info = key_info_cache[index].info;
+            return info->data_size != 0;
+        }
+    }
     SMCKeyData input = {0};
     SMCKeyData output;
     input.key = key;
     input.command = 9;
-    if (!smc_call(&input, &output)) return 0;
+    if (!smc_call(&input, &output)) {
+        // Only a definite "no such key" is cached; transport errors are retried.
+        if (output.result == SMC_KEY_NOT_FOUND) cache_key_info(key, (SMCKeyInfo){0});
+        return 0;
+    }
     *info = output.key_info;
+    if (info->data_size == 0 || info->data_size > 32) {
+        cache_key_info(key, (SMCKeyInfo){0});
+        return 0;
+    }
+    cache_key_info(key, *info);
     return 1;
 }
 
@@ -112,7 +156,10 @@ static int read_key(uint32_t key, SMCKeyInfo *info, uint8_t bytes[32]) {
     input.key = key;
     input.key_info = *info;
     input.command = 5;
-    if (!smc_call(&input, &output)) return 0;
+    if (!smc_call(&input, &output)) {
+        forget_key_info(key);
+        return 0;
+    }
     memcpy(bytes, output.bytes, info->data_size);
     return 1;
 }
@@ -158,7 +205,7 @@ static void discover_cpu_keys(void) {
         | ((uint32_t)count_bytes[2] << 8)
         | count_bytes[3];
 
-    for (uint32_t index = 0; index < count && cpu_key_count < 256; index++) {
+    for (uint32_t index = 0; index < count && cpu_key_count < CPU_KEY_CAPACITY; index++) {
         SMCKeyData input = {0};
         SMCKeyData output;
         input.command = 8;
@@ -193,6 +240,39 @@ double wattbar_cpu_temperature_celsius(void) {
     }
 
     return valid_count > 0 ? total / (double)valid_count : -1.0;
+}
+
+#define FAN_CAPACITY 4
+
+static int decode_fan_speed(uint32_t key, double *rpm) {
+    SMCKeyInfo info;
+    uint8_t bytes[32];
+    if (!read_key(key, &info, bytes) || info.data_type != fourcc("flt ") || info.data_size != 4) return 0;
+
+    float raw;
+    memcpy(&raw, bytes, sizeof(raw));
+    if (!isfinite(raw) || raw < 0 || raw > 20000) return 0;
+    *rpm = raw;
+    return 1;
+}
+
+double wattbar_fan_rpm(void) {
+    if (!setup_smc()) return -1.0;
+
+    // Fanless Macs report no FNum key, or a count of zero.
+    SMCKeyInfo count_info;
+    uint8_t count_bytes[32];
+    if (!read_key(fourcc("FNum"), &count_info, count_bytes) || count_info.data_size < 1) return -1.0;
+    uint8_t count = count_bytes[0] < FAN_CAPACITY ? count_bytes[0] : FAN_CAPACITY;
+
+    // Report the fastest fan; on two-fan Macs it is the one you hear.
+    double fastest = -1.0;
+    for (uint8_t index = 0; index < count; index++) {
+        const char name[4] = {'F', (char)('0' + index), 'A', 'c'};
+        double rpm;
+        if (decode_fan_speed(fourcc(name), &rpm) && rpm > fastest) fastest = rpm;
+    }
+    return fastest;
 }
 
 #ifdef WATTBAR_CPU_TEMPERATURE_TEST
